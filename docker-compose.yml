@@ -1,0 +1,162 @@
+name: vexa
+# version: '3.8' # Removed obsolete version
+
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    ports:
+      - "8056:8000"
+    environment:
+      - ADMIN_API_URL=http://admin-api:8001
+      - BOT_MANAGER_URL=http://bot-manager:8080
+      - TRANSCRIPTION_COLLECTOR_URL=http://transcription-collector:8000
+      - LOG_LEVEL=DEBUG
+    depends_on:
+      admin-api:
+        condition: service_started
+      bot-manager:
+        condition: service_started
+      transcription-collector:
+        condition: service_started
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  admin-api:
+    build:
+      context: .
+      dockerfile: services/admin-api/Dockerfile
+    ports:
+      - "8057:8001"
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=vexa
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - LOG_LEVEL=DEBUG
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  bot-manager:
+    build:
+      context: .
+      dockerfile: services/bot-manager/Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_IMAGE=vexa-bot:latest
+      - DOCKER_NETWORK=vexa_vexa_default
+      - LOG_LEVEL=DEBUG
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=vexa
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DOCKER_HOST=unix://var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  whisperlive:
+    build:
+      context: .
+      dockerfile: services/WhisperLive/Dockerfile.project
+    volumes:
+      - ./hub:/root/.cache/huggingface/hub
+      - ./services/WhisperLive/models:/app/models
+    environment:
+      - TRANSCRIPTION_COLLECTOR_URL=ws://transcription-collector:8000/collector
+    command:  ["--port", "9090", "--backend", "faster_whisper", "-fw", "/root/.cache/huggingface/hub/models--Systran--faster-whisper-medium/snapshots/08e178d48790749d25932bbc082711ddcfdfbc4f"]
+    ports:
+      - "9090:9090"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['3']
+              capabilities: [gpu]
+    depends_on:
+      transcription-collector:
+        condition: service_started
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  transcription-collector:
+    build:
+      context: .
+      dockerfile: services/transcription-collector/Dockerfile
+    ports:
+      - "8123:8000"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=vexa
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=DEBUG
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.0-alpine
+    volumes:
+      - redis-data:/data
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=vexa
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d vexa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vexa_default
+    restart: unless-stopped
+
+    ports:
+      - "5438:5432"
+
+volumes:
+  redis-data:
+  postgres-data:
+
+networks:
+  vexa_default:
+    driver: bridge
