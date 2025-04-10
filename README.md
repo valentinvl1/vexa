@@ -32,7 +32,7 @@ curl -X POST https://gateway.dev.vexa.ai/bots \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_CLIENT_API_KEY" \
   -d '{
-    "meeting_url": "https://meet.google.com/xxx-xxxx-xxx",
+    "native_meeting_id": "xxx-xxxx-xxx",
     "platform": "google_meet"
   }'
 ```
