@@ -14,11 +14,6 @@ Built with a **scalable architecture**, Vexa is designed to eventually support *
 
 ## API Capabilities
 
-<div align="left">
-  <a href="https://api.dev.vexa.ai/docs">
-    <img src="https://img.shields.io/badge/API-Documentation-2ea44f?style=for-the-badge" alt="API Documentation">
-  </a>
-</div>
 
 ## Simple API Integration
 **Set up and running in under 5 minutes**
