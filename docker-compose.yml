@@ -84,9 +84,10 @@ services:
       - ./services/WhisperLive/models:/app/models
     environment:
       - TRANSCRIPTION_COLLECTOR_URL=ws://transcription-collector:8000/collector
+      - LANGUAGE_DETECTION_SEGMENTS=${LANGUAGE_DETECTION_SEGMENTS}
+      - VAD_FILTER_THRESHOLD=${VAD_FILTER_THRESHOLD}
     command:  ["--port", "9090", "--backend", "faster_whisper", "-fw", "/root/.cache/huggingface/hub/models--Systran--faster-whisper-medium/snapshots/08e178d48790749d25932bbc082711ddcfdfbc4f"]
     # ports:
-    #   - "9090:9090"
     deploy:
       resources:
         reservations:

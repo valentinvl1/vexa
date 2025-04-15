@@ -298,7 +298,7 @@ class BatchedInferencePipeline:
         batch_size: int = 8,
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
-        language_detection_segments: int = 10, 
+        language_detection_segments: int = int(os.getenv('LANGUAGE_DETECTION_SEGMENTS', '10')), 
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """transcribe audio in chunks in batched fashion and return with language info.
 
@@ -376,6 +376,12 @@ class BatchedInferencePipeline:
             - a generator over transcribed segments
             - an instance of TranscriptionInfo
         """
+        
+        # --- Added Logging --- 
+        vad_threshold_env = float(os.getenv('VAD_FILTER_THRESHOLD', '0.5'))
+        print(f"[WhisperLive Transcriber] Using LANGUAGE_DETECTION_SEGMENTS: {language_detection_segments}")
+        print(f"[WhisperLive Transcriber] Using VAD_FILTER_THRESHOLD: {vad_threshold_env}")
+        # --- End Added Logging ---
 
         sampling_rate = self.model.feature_extractor.sampling_rate
 
@@ -395,17 +401,31 @@ class BatchedInferencePipeline:
         if not clip_timestamps:
             if vad_filter:
                 if vad_parameters is None:
+                    # Read VAD threshold from env var with default of 0.5
+                    vad_threshold_env = float(os.getenv('VAD_FILTER_THRESHOLD', '0.5'))
+                    print(f"[WhisperLive Transcriber] VAD parameters not provided, using threshold from env: {vad_threshold_env}") # Added log
+                    
                     vad_parameters = VadOptions(
                         max_speech_duration_s=chunk_length,
                         min_silence_duration_ms=160,
+                        threshold=vad_threshold_env,  # *** Use the env var here ***
                     )
                 elif isinstance(vad_parameters, dict):
-                    if "max_speech_duration_s" in vad_parameters.keys():
-                        vad_parameters.pop("max_speech_duration_s")
+                    # Use provided dict threshold if present, otherwise use env var
+                    if 'threshold' not in vad_parameters:
+                         vad_threshold_env = float(os.getenv('VAD_FILTER_THRESHOLD', '0.5'))
+                         print(f"[WhisperLive Transcriber] VAD threshold not in dict, using threshold from env: {vad_threshold_env}") # Added log
+                         vad_parameters['threshold'] = vad_threshold_env
+                    else:
+                        print(f"[WhisperLive Transcriber] Using VAD threshold from provided dict: {vad_parameters['threshold']}") # Added log
 
+                    # Ensure VadOptions is created from the possibly updated dict
                     vad_parameters = VadOptions(
                         **vad_parameters, max_speech_duration_s=chunk_length
                     )
+                # If vad_parameters is already VadOptions, use its threshold
+                elif isinstance(vad_parameters, VadOptions):
+                     print(f"[WhisperLive Transcriber] Using VAD threshold from provided VadOptions object: {vad_parameters.threshold}") # Added log
 
                 active_segments = get_speech_timestamps(audio, vad_parameters)
                 clip_timestamps = merge_segments(active_segments, vad_parameters)
@@ -734,7 +754,7 @@ class WhisperModel:
         hallucination_silence_threshold: Optional[float] = None,
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
-        language_detection_segments: int = 1,
+        language_detection_segments: int = int(os.getenv('LANGUAGE_DETECTION_SEGMENTS', '10')), 
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 

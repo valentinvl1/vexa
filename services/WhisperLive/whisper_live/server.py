@@ -311,7 +311,7 @@ class TranscriptionServer:
             return
 
         if client is None:
-            raise ValueError(f"Backend type {self.backend.value} not recognised or not handled.")
+            raise ValueError(f"Backend type {backend.value} not recognised or not handled.")
 
         self.client_manager.add_client(websocket, client)
 

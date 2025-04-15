@@ -1,5 +1,5 @@
 import sqlalchemy
-from sqlalchemy import (Column, String, Text, Integer, DateTime, Float, ForeignKey, Index)
+from sqlalchemy import (Column, String, Text, Integer, DateTime, Float, ForeignKey, Index, UniqueConstraint)
 from sqlalchemy.sql import func
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime # Needed for Transcription model default
@@ -40,14 +40,24 @@ class Meeting(Base):
     bot_container_id = Column(String(255), nullable=True)
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime, server_default=func.now(), index=True)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     user = relationship("User", back_populates="meetings")
     transcriptions = relationship("Transcription", back_populates="meeting")
 
-    # Optional: Unique constraint on user_id + platform + native_meeting_id
-    # __table_args__ = (UniqueConstraint('user_id', 'platform', 'native_meeting_id', name='_user_platform_native_id_uc'),)
+    # Add composite index for efficient lookup by user, platform, and native ID, including created_at for sorting
+    __table_args__ = (
+        Index(
+            'ix_meeting_user_platform_native_id_created_at',
+            'user_id',
+            'platform',
+            'platform_specific_id',
+            'created_at' # Include created_at because the query orders by it
+        ),
+        # Optional: Unique constraint (uncomment if needed, ensure native_meeting_id cannot be NULL if unique)
+        # UniqueConstraint('user_id', 'platform', 'platform_specific_id', name='_user_platform_native_id_uc'),
+    )
 
     # Add property getters/setters for compatibility
     @property
