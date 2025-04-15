@@ -20,6 +20,11 @@ try:
 except Exception:
     pass
 
+# Import for health check HTTP server
+import http.server
+import socketserver
+import threading
+
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 
@@ -241,6 +246,10 @@ class TranscriptionServer:
         self.no_voice_activity_chunks = 0
         self.use_vad = True
         self.single_model = False
+        # Flag to track if server is healthy
+        self.is_healthy = False
+        # Health check HTTP server
+        self.health_server = None
 
     def initialize_client(
         self, websocket, options, faster_whisper_custom_model_path,
@@ -480,6 +489,9 @@ class TranscriptionServer:
         # Log server startup information
         logger.info(f"SERVER_START: host={host}, port={port}, backend={backend}, single_model={single_model}")
         
+        # Start health check HTTP server on port+1
+        self.start_health_check_server(host, port + 1)
+        
         with serve(
             functools.partial(
                 self.recv_audio,
@@ -491,7 +503,9 @@ class TranscriptionServer:
             host,
             port
         ) as server:
-            logger.info(f"SERVER_RUNNING: WhisperLive server running on {host}:{port}")
+            # Mark server as healthy once websocket server is running
+            self.is_healthy = True
+            logger.info(f"SERVER_RUNNING: WhisperLive server running on {host}:{port} with health check on {host}:{port+1}/health")
             server.serve_forever()
 
     def voice_activity(self, websocket, frame_np):
@@ -533,6 +547,50 @@ class TranscriptionServer:
         """
         if self.client_manager.get_client(websocket):
             self.client_manager.remove_client(websocket)
+
+    def start_health_check_server(self, host, port):
+        """Start a simple HTTP server for health checks.
+        
+        This runs in a separate thread and listens on a different port than the WebSocket server.
+        """
+        class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
+            parent_server = self
+            
+            def do_GET(self):
+                if self.path == '/health':
+                    if self.parent_server.is_healthy:
+                        self.send_response(200)
+                        self.send_header('Content-type', 'text/plain')
+                        self.end_headers()
+                        self.wfile.write(b'OK')
+                    else:
+                        self.send_response(503)
+                        self.send_header('Content-type', 'text/plain')
+                        self.end_headers()
+                        self.wfile.write(b'Service Unavailable')
+                else:
+                    self.send_response(404)
+                    self.send_header('Content-type', 'text/plain')
+                    self.end_headers()
+                    self.wfile.write(b'Not Found')
+            
+            # Silence server logs
+            def log_message(self, format, *args):
+                return
+        
+        # Create HTTP server for health checks
+        try:
+            handler = HealthCheckHandler
+            self.health_server = socketserver.TCPServer((host, port), handler)
+            
+            # Start server in a new thread
+            health_thread = threading.Thread(target=self.health_server.serve_forever)
+            health_thread.daemon = True  # So it stops when the main thread stops
+            health_thread.start()
+            
+            logging.info(f"Health check HTTP server started on {host}:{port}")
+        except Exception as e:
+            logging.error(f"Failed to start health check server: {e}")
 
 
 class ServeClientBase(object):

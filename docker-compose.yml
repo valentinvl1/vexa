@@ -13,6 +13,7 @@ services:
       - BOT_MANAGER_URL=http://bot-manager:8080
       - TRANSCRIPTION_COLLECTOR_URL=http://transcription-collector:8000
       - LOG_LEVEL=DEBUG
+    init: true
     depends_on:
       admin-api:
         condition: service_started
@@ -40,6 +41,7 @@ services:
       - DB_USER=postgres
       - DB_PASSWORD=postgres
       - LOG_LEVEL=DEBUG
+    init: true
     depends_on:
       redis:
         condition: service_started
@@ -66,6 +68,7 @@ services:
       - DOCKER_HOST=unix://var/run/docker.sock
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+    init: true
     depends_on:
       redis:
         condition: service_started
@@ -87,19 +90,71 @@ services:
       - LANGUAGE_DETECTION_SEGMENTS=${LANGUAGE_DETECTION_SEGMENTS}
       - VAD_FILTER_THRESHOLD=${VAD_FILTER_THRESHOLD}
     command:  ["--port", "9090", "--backend", "faster_whisper", "-fw", "/root/.cache/huggingface/hub/models--Systran--faster-whisper-medium/snapshots/08e178d48790749d25932bbc082711ddcfdfbc4f"]
-    # ports:
+    # Expose 9091 port for health checks (9090 + 1)
+    expose:
+      - "9090"
+      - "9091"
     deploy:
+      replicas: 3  # Sets to 1 to avoid GPU contention
       resources:
         reservations:
           devices:
             - driver: nvidia
               device_ids: ['3']
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s  # Give time for model loading
+    init: true
     depends_on:
       transcription-collector:
         condition: service_started
     networks:
       - vexa_default
+      - whispernet
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Add Traefik labels for service discovery
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.whisperlive.rule=Host(`whisperlive.localhost`)"
+      - "traefik.http.routers.whisperlive.entrypoints=web"
+      - "traefik.http.services.whisperlive.loadbalancer.server.port=9090"
+      # Special headers for WebSocket support
+      - "traefik.http.middlewares.whisperlive-headers.headers.customrequestheaders.Connection=upgrade"
+      - "traefik.http.middlewares.whisperlive-headers.headers.customrequestheaders.Upgrade=websocket"
+      - "traefik.http.routers.whisperlive.middlewares=whisperlive-headers"
+
+  # Replace nginx load-balancer with Traefik
+  traefik:
+    image: traefik:v2.10
+    ports:
+      - "9090:80"  # Expose on host port 9090 (same as the old Nginx)
+      - "8085:8080"  # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.toml:/etc/traefik/traefik.toml:ro
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--log.level=DEBUG"
+    networks:
+      - vexa_default
+      - whispernet
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://localhost/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
   transcription-collector:
@@ -117,6 +172,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - LOG_LEVEL=DEBUG
+    init: true
     depends_on:
       redis:
         condition: service_started
@@ -150,7 +206,6 @@ services:
     networks:
       - vexa_default
     restart: unless-stopped
-
     ports:
       - "5438:5432"
 
@@ -160,4 +215,6 @@ volumes:
 
 networks:
   vexa_default:
+    driver: bridge
+  whispernet:
     driver: bridge

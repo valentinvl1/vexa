@@ -329,7 +329,7 @@ async def process_redis_to_postgres():
         except asyncio.CancelledError:
             logger.info("Background processor task cancelled")
             break
-    except Exception as e:
+        except Exception as e:
             logger.error(f"Unhandled error in background processor: {e}", exc_info=True)
             # Don't break the loop - keep trying after sleep
 
