@@ -5,9 +5,16 @@ import uuid
 import os
 import time
 from typing import Optional
+from datetime import datetime, timezone
+import asyncio
 
 # Import the Platform class from shared models
 from shared_models.schemas import Platform
+
+# ---> ADD Missing imports for _record_session_start
+from shared_models.database import async_session_local
+from shared_models.models import MeetingSession
+# <--- END ADD
 
 # Assuming these are still needed from config or env
 DOCKER_HOST = os.environ.get("DOCKER_HOST", "unix://var/run/docker.sock")
@@ -92,6 +99,22 @@ def close_docker_client(): # Keep name for compatibility in main.py
             logger.warning(f"Error closing requests_unixsocket session: {e}")
         _socket_session = None
 
+# Helper async function to record session start
+async def _record_session_start(meeting_id: int, session_uid: str):
+    try:
+        async with async_session_local() as db_session:
+            new_session = MeetingSession(
+                meeting_id=meeting_id,
+                session_uid=session_uid, 
+                session_start_time=datetime.now(timezone.utc) # Record timestamp
+            )
+            db_session.add(new_session)
+            await db_session.commit()
+            logger.info(f"Recorded start for session {session_uid} for meeting {meeting_id}")
+    except Exception as db_err:
+        logger.error(f"Failed to record session start for session {session_uid}, meeting {meeting_id}: {db_err}", exc_info=True)
+        # Log error but allow the main function to continue
+
 def start_bot_container(
     meeting_id: int,
     meeting_url: Optional[str],
@@ -99,28 +122,33 @@ def start_bot_container(
     bot_name: Optional[str],
     user_token: str, # *** ADDED ***
     native_meeting_id: str # *** ADDED ***
-) -> Optional[str]:
-    """Starts a vexa-bot container using requests_unixsocket.
-    
+) -> Optional[tuple[str, str]]:
+    """
+    Starts a vexa-bot container via requests_unixsocket.
+
     Args:
-        meeting_id: The internal database ID for the meeting.
-        meeting_url: The *constructed* meeting URL (can be None).
-        platform: The platform string (e.g., 'google_meet').
-        bot_name: Optional name for the bot.
-        user_token: The API token of the user requesting the bot. # *** ADDED doc ***
-        native_meeting_id: The platform-specific meeting ID (e.g., 'xyz-abc-pdq'). # *** ADDED doc ***
+        meeting_id: Internal database ID of the meeting.
+        meeting_url: The URL for the bot to join.
+        platform: The meeting platform (external name).
+        bot_name: An optional name for the bot inside the meeting.
+        user_token: The API token of the user requesting the bot.
+        native_meeting_id: The platform-specific meeting ID (e.g., 'xyz-abc-pdq').
         
     Returns:
-        The container ID if successful, None otherwise.
+        A tuple (container_id, connection_id) if successful, None otherwise.
     """
     session = get_socket_session()
     if not session:
         logger.error("Cannot start bot container, requests_unixsocket session not available.")
-        return None
+        return None, None
 
     container_name = f"vexa-bot-{meeting_id}-{uuid.uuid4().hex[:8]}"
     if not bot_name:
         bot_name = f"VexaBot-{uuid.uuid4().hex[:6]}"
+
+    # *** Generate unique connection ID ***
+    connection_id = str(uuid.uuid4())
+    logger.info(f"Generated unique connectionId for bot session: {connection_id}")
 
     # Construct BOT_CONFIG JSON - Use external platform name directly
     bot_config_data = {
@@ -130,7 +158,7 @@ def start_bot_container(
         "botName": bot_name,
         "token": user_token,              # Use the passed user_token
         "nativeMeetingId": native_meeting_id, # Use the passed native_meeting_id
-        "connectionId": "",               # Keep default empty string for now
+        "connectionId": connection_id,      # *** Use generated unique ID ***
         "automaticLeave": {
             "waitingRoomTimeout": 300000,
             "noOneJoinedTimeout": 300000,
@@ -166,6 +194,7 @@ def start_bot_container(
     create_url = f'{socket_url_base}/containers/create?name={container_name}'
     start_url_template = f'{socket_url_base}/containers/{{}}/start'
 
+    container_id = None # Initialize container_id
     try:
         logger.info(f"Attempting to create bot container '{container_name}' ({BOT_IMAGE_NAME}) via socket ({socket_url_base})...")
         response = session.post(create_url, json=create_payload)
@@ -175,7 +204,7 @@ def start_bot_container(
 
         if not container_id:
             logger.error(f"Failed to create container: No ID in response: {container_info}")
-            return None
+            return None, None
 
         logger.info(f"Container {container_id} created. Starting...")
 
@@ -184,17 +213,30 @@ def start_bot_container(
 
         if response.status_code != 204:
             logger.error(f"Failed to start container {container_id}. Status: {response.status_code}, Response: {response.text}")
-            return None
+            # Consider removing the created container if start fails?
+            return None, None
 
         logger.info(f"Successfully started container {container_id} for meeting: {meeting_id}")
-        return container_id
+        
+        # *** REMOVED Session Recording Call - To be handled by caller ***
+        # try:
+        #     asyncio.run(_record_session_start(meeting_id, connection_id))
+        # except RuntimeError as e:
+        #     logger.error(f"Error running async session recording: {e}. Session start NOT recorded.")
+
+        return container_id, connection_id # Return both values
 
     except requests_unixsocket.exceptions.RequestException as e:
         logger.error(f"HTTP error communicating with Docker socket: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"Unexpected error starting container via socket: {e}", exc_info=True)
 
-    return None
+    # Clean up created container if start failed or exception occurred before returning container_id
+    # This requires careful handling to avoid race conditions if another process is managing it.
+    # For now, relying on AutoRemove=True might be sufficient if start fails cleanly.
+    # If an exception happens between create and start success logging, container might linger.
+
+    return None, None # Return None for both if error occurs
 
 def stop_bot_container(container_id: str) -> bool:
     """Stops a container using its ID via requests_unixsocket."""

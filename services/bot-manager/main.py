@@ -7,6 +7,7 @@ import os
 import base64
 from typing import Optional
 import redis.asyncio as aioredis
+import asyncio # <--- Import asyncio
 
 # Local imports - Remove unused ones
 # from app.database.models import init_db # Using local init_db now
@@ -14,7 +15,7 @@ import redis.asyncio as aioredis
 # from app.tasks.monitoring import celery_app # Not used here
 
 from config import BOT_IMAGE_NAME, REDIS_URL
-from docker_utils import get_socket_session, close_docker_client, start_bot_container, stop_bot_container
+from docker_utils import get_socket_session, close_docker_client, start_bot_container, stop_bot_container, _record_session_start
 from shared_models.database import init_db, get_db
 from shared_models.models import User, Meeting # Import Meeting model
 from shared_models.schemas import MeetingCreate, MeetingResponse, Platform # Import new schemas and Platform
@@ -50,7 +51,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting up Bot Manager...")
-    await init_db()
+    # await init_db() # Removed - Admin API should handle this
     # await init_redis() # Removed redis init if not used elsewhere
     try:
         get_socket_session()
@@ -134,10 +135,12 @@ async def request_bot(
 
     # 4. Start the bot container
     container_id = None
+    connection_id = None # Initialize connection_id
     try:
         logger.info(f"Attempting to start bot container for meeting {meeting_id} (native: {native_meeting_id})...")
         # MODIFY the call to start_bot_container:
-        container_id = start_bot_container(
+        # Unpack both container_id and connection_id
+        container_id, connection_id = start_bot_container(
             meeting_id=meeting_id,           # Internal DB ID
             meeting_url=constructed_url,     # Constructed URL (still pass it to bot if needed)
             platform=req.platform.value,     # Platform string
@@ -145,18 +148,28 @@ async def request_bot(
             user_token=user_token,           # *** ADDED: Pass the user's API token ***
             native_meeting_id=native_meeting_id # *** ADDED: Pass the native meeting ID ***
         )
-        logger.info(f"Call to start_bot_container completed. Container ID: {container_id}") # Log after start
+        logger.info(f"Call to start_bot_container completed. Container ID: {container_id}, Connection ID: {connection_id}") # Log both IDs
 
-        if not container_id:
-            logger.error(f"Failed to start bot container for meeting {meeting_id} (start_bot_container returned None)")
+        if not container_id or not connection_id:
+            # Log specific error based on which ID is missing
+            error_msg = "Failed to start bot container."
+            if not container_id:
+                error_msg += " Container ID not returned."
+            if not connection_id:
+                error_msg += " Connection ID not generated/returned."
+            logger.error(f"{error_msg} for meeting {meeting_id}")
+            
             # Update status immediately if start failed
             new_meeting.status = 'error'
             await db.commit()
-            # Use await db.refresh(new_meeting) if needed, but commit might be enough
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={"status": "error", "message": "Failed to start bot container.", "meeting_id": meeting_id}
+                detail={"status": "error", "message": error_msg, "meeting_id": meeting_id}
             )
+
+        # *** Schedule session start recording AFTER successful container start ***
+        asyncio.create_task(_record_session_start(meeting_id, connection_id))
+        logger.info(f"Scheduled background task to record session start for meeting {meeting_id}, session {connection_id}")
 
         # 5. Update Meeting record with container details and status
         logger.info(f"Attempting to update meeting {meeting_id} status to active with container ID {container_id}...") # Log before update

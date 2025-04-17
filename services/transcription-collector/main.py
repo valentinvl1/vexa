@@ -5,18 +5,18 @@ import logging
 import uuid
 import os
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import redis # Import base redis package for exceptions
 import redis.asyncio as aioredis # Use alias for async client
 from sqlalchemy import select, and_, func, distinct, text
 from fastapi.security.api_key import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
-from typing import Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set, Tuple
 from pydantic import ValidationError
 
 from shared_models.database import get_db, init_db, async_session_local
-from shared_models.models import APIToken, User, Meeting, Transcription
+from shared_models.models import APIToken, User, Meeting, Transcription, MeetingSession
 from shared_models.schemas import (
     TranscriptionSegment, 
     HealthResponse, 
@@ -130,7 +130,6 @@ async def startup():
             return
     
     # Initialize database connection
-    await init_db()
     logger.info("Database initialized.")
     
     # Claim stale pending messages before starting main loop
@@ -157,7 +156,7 @@ async def shutdown():
                 logger.info(f"Background task {i+1} cancelled.")
             except Exception as e:
                 logger.error(f"Error during background task {i+1} cancellation: {e}", exc_info=True)
-
+    
     # Close Redis connection
     if redis_client:
         await redis_client.close()
@@ -208,7 +207,7 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
                 if not meeting:
                     logger.warning(f"Meeting lookup failed for message {message_id}: No meeting found for user {user.id}, platform '{stream_data['platform']}', native ID '{stream_data['meeting_id']}'")
                     return True # Persistent data issue, OK to ACK
-                
+
                 internal_meeting_id = meeting.id
 
             except ValueError as ve:
@@ -245,20 +244,22 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
                  
                  # Get text, default to empty string if missing or None
                  text_content = segment.get('text') or ""
-                 # Get language, default to 'en' if missing or None
-                 language_content = segment.get('language') or "en"
+                 # Get language, default to None if missing
+                 language_content = segment.get('language')
 
              except (ValueError, TypeError) as time_err:
                  logger.warning(f"[Msg {message_id}/Meet {internal_meeting_id}] Skipping segment {i} with invalid time format: {time_err} - Segment: {segment}")
                  continue
-
+                        
              # Create data for Redis Hash
              start_time_key = f"{start_time_float:.3f}"
+             session_uid_from_payload = stream_data.get('uid') # Get uid from message payload
              segment_redis_data = {
                  "text": text_content,
                  "end_time": end_time_float,
                  "language": language_content,
-                 "updated_at": datetime.utcnow().isoformat() + "Z"
+                 "updated_at": datetime.utcnow().isoformat() + "Z",
+                 "session_uid": session_uid_from_payload # Add session_uid
              }
              segments_to_store[start_time_key] = json.dumps(segment_redis_data)
              segment_count += 1
@@ -322,79 +323,119 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
 
 # --- Function to claim and process stale messages ---
 async def claim_stale_messages():
-    logger.info(f"Checking for stale messages pending longer than {PENDING_MSG_TIMEOUT_MS}ms...")
+    claim_start_id = '0-0' # Start claiming from the beginning of time
+    messages_claimed_total = 0
     processed_claim_count = 0
     acked_claim_count = 0
+    error_claim_count = 0
+
+    logger.info(f"Starting stale message check (idle > {PENDING_MSG_TIMEOUT_MS}ms).")
+
     try:
-        # 1. Use XPENDING with idle parameter to get stale messages directly
-        # The result format is slightly different: [count, min_id, max_id, [[consumer, pending_count], ...]]
-        # We need the more detailed form by specifying start/end/count
-        stale_messages_details = await redis_client.xpending(
-            name=REDIS_STREAM_NAME, 
-            groupname=REDIS_CONSUMER_GROUP, 
-            idle=PENDING_MSG_TIMEOUT_MS,
-            start='-', # Required for detailed view with idle time
-            end='+',   # Required for detailed view with idle time
-            count=100  # Limit how many we check/claim at once
-        )
+        while True:
+            # Claim a batch of potentially stale messages for THIS consumer
+            # XCLAIM <key> <group> <consumer> <min-idle-time> <ID-1> <ID-2> ... [FORCE] [JUSTID]
+            # We claim IDs starting from claim_start_id
+            # Note: xclaim itself returns only the messages successfully claimed.
+            #       It needs message IDs to attempt claiming. We provide '0-0' initially
+            #       and then the ID of the last claimed message on subsequent calls
+            #       if we were looping (but we'll use xpending_range first).
 
-        if not stale_messages_details:
-            logger.info("No stale pending messages found exceeding the timeout.")
-            return
+            # Let's rethink: XCLAIM needs specific IDs. The easier approach is:
+            # 1. Find *all* pending messages (like the original code started to do).
+            # 2. Filter those by idle time.
+            # 3. Attempt to XCLAIM the filtered IDs.
 
-        # Extract message IDs from the detailed result
-        # Format: [{'message_id': ..., 'consumer': ..., 'idle': ..., 'delivered': ...}, ...]
-        stale_message_ids = [msg['message_id'] for msg in stale_messages_details]
-        
-        if not stale_message_ids:
-            logger.info("No stale message IDs extracted from xpending details.")
-            return
-            
-        logger.warning(f"Found {len(stale_message_ids)} potentially stale messages idle > {PENDING_MSG_TIMEOUT_MS}ms: {stale_message_ids[:10]}...")
+            # 1. Get detailed list of *all* pending messages for the group
+            pending_details = await redis_client.xpending_range(
+                name=REDIS_STREAM_NAME,
+                groupname=REDIS_CONSUMER_GROUP,
+                min='-', # Start of stream
+                max='+', # End of stream
+                count=100 # Process in batches
+            )
 
-        # 2. Claim these messages for the current consumer
-        claimed_messages_data = await redis_client.xclaim(
-            name=REDIS_STREAM_NAME,
-            groupname=REDIS_CONSUMER_GROUP,
-            consumername=CONSUMER_NAME,
-            min_idle_time=0, # Set min_idle_time to 0 for XCLAIM as we already filtered by idle time
-            message_ids=stale_message_ids,
-        )
+            if not pending_details:
+                logger.info("No more pending messages found for the group.")
+                break # Exit the while loop
 
-        if not claimed_messages_data:
-            logger.info("No messages were successfully claimed this time (might have been processed or claimed by others).")
-            return
-        
-        claimed_messages_dict = {mid: dict(zip(mdata[::2], mdata[1::2])) for mid, mdata in claimed_messages_data if mdata}
-        claimed_ids = list(claimed_messages_dict.keys())
-        
-        logger.info(f"Successfully claimed {len(claimed_ids)} messages: {claimed_ids[:10]}... Processing them now...")
-        
-        message_ids_to_ack = []
-        for message_id, message_data in claimed_messages_dict.items():
-             should_ack = False
-             processed_claim_count += 1
-             try:
-                 should_ack = await process_stream_message(message_id, message_data)
-             except Exception as e:
-                 logger.error(f"Critical error during claim processing helper call for {message_id}: {e}", exc_info=True)
-                 should_ack = False
-             finally:
-                  if should_ack:
-                       message_ids_to_ack.append(message_id)
-        
-        if message_ids_to_ack:
-            acked_claim_count = len(message_ids_to_ack)
-            try:
-                await redis_client.xack(REDIS_STREAM_NAME, REDIS_CONSUMER_GROUP, *message_ids_to_ack)
-                logger.info(f"Acknowledged {acked_claim_count} processed claimed messages.")
-            except Exception as ack_err:
-                 logger.error(f"Failed to ACK claimed messages {message_ids_to_ack}: {ack_err}", exc_info=True)
+            # 2. Filter by idle time
+            stale_candidates = [
+                msg for msg in pending_details
+                if msg['idle'] > PENDING_MSG_TIMEOUT_MS
+            ]
 
+            if not stale_candidates:
+                logger.info("No messages found exceeding idle time in the current pending batch.")
+                # If pending_details had messages but none were stale enough,
+                # it implies we've checked all relevant messages for staleness.
+                # (Assuming messages are processed roughly in order).
+                # If pending_details was less than count=100, we're definitely done.
+                if len(pending_details) < 100:
+                    break
+                else:
+                    # There might be more pending messages, continue check from last seen ID?
+                    # This logic gets complex. Let's stick to a simpler approach for now:
+                    # Claim messages explicitly idle > threshold using XAUTOCLAIM if available,
+                    # otherwise fall back to XPENDING + XCLAIM.
+                    # Assuming XAUTOCLAIM is not used/available based on prior errors:
+                    # We'll just check the first batch of 100. If more complex handling is needed,
+                    # it requires careful pagination with xpending_range.
+                    logger.warning("Checked 100 pending messages, none were stale. More might exist but stopping check for this run.")
+                    break
+
+
+            stale_message_ids = [msg['message_id'] for msg in stale_candidates]
+            logger.info(f"Found {len(stale_message_ids)} potentially stale message(s) in pending list: {stale_message_ids}")
+
+            # 3. Attempt to XCLAIM the stale message IDs for *this* consumer
+            if stale_message_ids:
+                # xclaim(stream, group, consumer, min_idle_time, message_ids)
+                claimed_messages = await redis_client.xclaim(
+                    name=REDIS_STREAM_NAME,
+                    groupname=REDIS_CONSUMER_GROUP,
+                    consumername=CONSUMER_NAME,
+                    min_idle_time=PENDING_MSG_TIMEOUT_MS, # Ensure they are still stale
+                    message_ids=stale_message_ids,
+                )
+                # claimed_messages format: [[message_id, {field: value, ...}], ...] or [] if none claimed
+
+                messages_claimed_now = len(claimed_messages)
+                messages_claimed_total += messages_claimed_now
+                logger.info(f"Successfully claimed {messages_claimed_now} stale message(s): {[msg[0] for msg in claimed_messages]}")
+
+                # 4. Process the claimed messages
+                for message_id_bytes, message_data_bytes in claimed_messages:
+                    message_id = message_id_bytes.decode('utf-8')
+                    # Decode message data from bytes
+                    message_data = {k.decode('utf-8'): v.decode('utf-8') for k, v in message_data_bytes.items()}
+                    logger.info(f"Processing claimed stale message {message_id}...")
+                    processed_claim_count += 1
+                    try:
+                        success = await process_stream_message(message_id, message_data)
+                        if success:
+                            logger.info(f"Successfully processed claimed stale message {message_id}. Acknowledging.")
+                            await redis_client.xack(REDIS_STREAM_NAME, REDIS_CONSUMER_GROUP, message_id)
+                            acked_claim_count += 1
+                        else:
+                            # Processing failed, don't ACK, it might be claimed again later
+                            logger.warning(f"Processing failed for claimed stale message {message_id}. Not acknowledging.")
+                            error_claim_count += 1
+                    except Exception as e:
+                        logger.error(f"Error processing claimed stale message {message_id}: {e}", exc_info=True)
+                        error_claim_count += 1
+                        # Don't ACK on unexpected error
+
+            # If we claimed messages, or if we didn't find any stale ones in a full batch, break.
+            # This simplifies logic to avoid infinite loops if xpending_range pagination isn't fully handled.
+            break
+
+    except redis.exceptions.RedisError as e:
+        logger.error(f"Redis error during stale message claiming: {e}", exc_info=True)
     except Exception as e:
-        logger.error(f"Error during stale message claiming process: {e}", exc_info=True)
-    finally:
-        logger.info(f"Stale message check finished. Processed: {processed_claim_count}, Acknowledged: {acked_claim_count}.")
+        logger.error(f"Unexpected error during stale message claiming: {e}", exc_info=True)
+
+    logger.info(f"Stale message check finished. Total claimed: {messages_claimed_total}, Processed: {processed_claim_count}, Acked: {acked_claim_count}, Errors: {error_claim_count}")
 
 # --- New Redis Stream Consumer Task ---
 async def consume_redis_stream():
@@ -433,9 +474,8 @@ async def consume_redis_stream():
                         # Log any error during the helper call itself, although it should handle most internally
                         logger.error(f"Critical error during main loop processing helper call for {message_id}: {e}", exc_info=True)
                         should_ack = False # Do not ACK if the helper itself crashed unexpectedly
-                    finally:
-                        if should_ack:
-                            message_ids_to_ack.append(message_id)
+                    if should_ack:
+                        message_ids_to_ack.append(message_id)
                         
                 # Acknowledge messages processed in this batch
                 if message_ids_to_ack:
@@ -445,13 +485,13 @@ async def consume_redis_stream():
                     except Exception as e:
                         logger.error(f"Failed to acknowledge messages {message_ids_to_ack}: {e}", exc_info=True)
                         # Messages will remain pending and might be re-processed by this or another consumer
-
+        
         except asyncio.CancelledError:
             logger.info("Redis Stream consumer task cancelled.")
             break
         except redis.exceptions.ConnectionError as e:
-             logger.error(f"Redis connection error in stream consumer: {e}. Retrying after delay...", exc_info=True)
-             await asyncio.sleep(5)
+            logger.error(f"Redis connection error in stream consumer: {e}. Retrying after delay...", exc_info=True)
+            await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Unhandled error in Redis Stream consumer loop: {e}", exc_info=True)
             await asyncio.sleep(5)
@@ -514,6 +554,7 @@ async def process_redis_to_postgres():
                         for start_time_str, segment_json in redis_segments.items():
                             try:
                                 segment_data = json.loads(segment_json)
+                                segment_session_uid = segment_data.get("session_uid") # Extract session_uid
                                 # Check for 'updated_at' key added by the stream consumer
                                 if 'updated_at' not in segment_data:
                                      logger.warning(f"Segment {start_time_str} in meeting {meeting_id} hash is missing 'updated_at'. Skipping immutability check.")
@@ -526,14 +567,15 @@ async def process_redis_to_postgres():
                                 # Ensure comparison is between timezone-aware datetimes or both naive UTC
                                 if segment_updated_at.replace(tzinfo=None) < immutability_time: # Compare naive UTC
                                     # Apply filtering
-                                    if transcription_filter.filter_segment(segment_data['text'], language=segment_data.get('language', 'en')):
+                                    if transcription_filter.filter_segment(segment_data['text'], language=segment_data.get('language')):
                                         # Create Transcription object
                                         new_transcription = create_transcription_object(
                                             meeting_id=meeting_id,
                                             start=float(start_time_str),
                                             end=segment_data['end_time'],
                                             text=segment_data['text'],
-                                            language=segment_data.get('language')
+                                            language=segment_data.get('language'),
+                                            session_uid=segment_session_uid # Pass session_uid
                                         )
                                         batch_to_store.append(new_transcription)
                                     
@@ -581,7 +623,7 @@ async def process_redis_to_postgres():
 # --- Helper Functions ---
 
 # Simplified function - assumes meeting_id is valid
-def create_transcription_object(meeting_id: int, start: float, end: float, text: str, language: Optional[str]) -> Transcription:
+def create_transcription_object(meeting_id: int, start: float, end: float, text: str, language: Optional[str], session_uid: Optional[str]) -> Transcription:
     """Creates a Transcription ORM object without adding/committing."""
     return Transcription(
         meeting_id=meeting_id,
@@ -589,6 +631,7 @@ def create_transcription_object(meeting_id: int, start: float, end: float, text:
         end_time=end,
         text=text,
         language=language,
+        session_uid=session_uid, # Add session_uid
         created_at=datetime.utcnow() # Record creation time in DB
     )
 
@@ -646,7 +689,7 @@ async def get_transcript_by_native_id(
     """Retrieves the meeting details and transcript segments for a meeting specified by its platform and native ID.
     Finds the *latest* matching meeting record for the user.
     
-    Combines data from both PostgreSQL (immutable segments) and Redis Hashes (mutable segments).
+    Combines data from both PostgreSQL (immutable segments) and Redis Hashes (mutable segments), sorting chronologically based on session start times.
     """
     logger.debug(f"[API] User {current_user.id} requested transcript for {platform.value} / {native_meeting_id}")
 
@@ -671,17 +714,27 @@ async def get_transcript_by_native_id(
     internal_meeting_id = meeting.id
     logger.debug(f"[API] Found meeting record ID {internal_meeting_id}")
 
-    # 2. Fetch transcript segments from PostgreSQL (immutable segments)
+    # 2. Fetch session start times for this meeting
+    logger.debug(f"[API Meet {internal_meeting_id}] Fetching session start times...")
+    stmt_sessions = select(MeetingSession).where(MeetingSession.meeting_id == internal_meeting_id)
+    result_sessions = await db.execute(stmt_sessions)
+    sessions = result_sessions.scalars().all()
+    session_times: Dict[str, datetime] = {session.session_uid: session.session_start_time for session in sessions}
+    logger.debug(f"[API Meet {internal_meeting_id}] Found {len(session_times)} sessions: {list(session_times.keys())}")
+    if not session_times:
+        logger.warning(f"[API Meet {internal_meeting_id}] No session start times found in DB. Sorting may be inaccurate if reconnections occurred.")
+
+    # 3. Fetch transcript segments from PostgreSQL (immutable segments)
     logger.debug(f"[API Meet {internal_meeting_id}] Fetching segments from PostgreSQL...")
     stmt_transcripts = select(Transcription).where(
         Transcription.meeting_id == internal_meeting_id
-    ).order_by(Transcription.start_time)
-
+    )
+    # Note: No longer sorting by start_time here, will sort by calculated absolute time later
     result_transcripts = await db.execute(stmt_transcripts)
     db_segments = result_transcripts.scalars().all()
     logger.debug(f"[API Meet {internal_meeting_id}] Retrieved {len(db_segments)} segments from PostgreSQL.")
     
-    # 3. Fetch segments from Redis (mutable segments)
+    # 4. Fetch segments from Redis (mutable segments)
     hash_key = f"meeting:{internal_meeting_id}:segments"
     redis_segments_raw = {}
     logger.debug(f"[API Meet {internal_meeting_id}] Fetching segments from Redis Hash: {hash_key}...")
@@ -690,53 +743,127 @@ async def get_transcript_by_native_id(
             redis_segments_raw = await redis_client.hgetall(hash_key)
             logger.debug(f"[API Meet {internal_meeting_id}] Retrieved {len(redis_segments_raw)} raw segments from Redis Hash.")
         else: 
-             logger.error(f"[API Meet {internal_meeting_id}] Redis client not available for fetching mutable segments")
+            logger.error(f"[API Meet {internal_meeting_id}] Redis client not available for fetching mutable segments")
     except Exception as e:
         logger.error(f"[API Meet {internal_meeting_id}] Failed to fetch mutable segments from Redis: {e}", exc_info=True)
-        # Proceed with only DB segments if Redis fails
-
-    # 4. Merge segments, with Redis taking precedence for the same start_time
-    logger.debug(f"[API Meet {internal_meeting_id}] Merging {len(db_segments)} DB segments and {len(redis_segments_raw)} Redis segments...")
-    merged_segments: Dict[str, TranscriptionSegment] = {}
+        # redis_segments_raw remains empty, allowing processing to continue with DB segments only
     
-    # Add PostgreSQL segments first
+    # 5. Calculate absolute times and merge segments
+    logger.debug(f"[API Meet {internal_meeting_id}] Calculating absolute times and merging...")
+    # Store as: {relative_start_str: (absolute_datetime, segment_object)} to handle overwrites correctly
+    merged_segments_with_abs_time: Dict[str, Tuple[datetime, TranscriptionSegment]] = {}
+
+    # Process PostgreSQL segments first
     for segment in db_segments:
         key = f"{segment.start_time:.3f}"
-        merged_segments[key] = TranscriptionSegment(
-            start_time=segment.start_time,
-            end_time=segment.end_time,
-            text=segment.text,
-            language=segment.language
-        )
-    
-    # Add Redis segments (overwriting PostgreSQL ones with same start_time)
+        session_uid = segment.session_uid
+        session_start = session_times.get(session_uid)
+        if session_uid and session_start:
+            try:
+                # Ensure session_start is timezone-aware (should be from DB)
+                if session_start.tzinfo is None:
+                     session_start = session_start.replace(tzinfo=timezone.utc)
+                     
+                # Calculate absolute start and end times
+                absolute_start_time = session_start + timedelta(seconds=segment.start_time)
+                absolute_end_time = session_start + timedelta(seconds=segment.end_time)
+                
+                segment_obj = TranscriptionSegment(
+                    start_time=segment.start_time,
+                    end_time=segment.end_time,
+                    text=segment.text,
+                    language=segment.language,
+                    created_at=segment.created_at, # Corrected previously
+                    # ---> ADD Populate absolute times <----
+                    absolute_start_time=absolute_start_time,
+                    absolute_end_time=absolute_end_time
+                    # ---> END ADD <----
+                )
+                merged_segments_with_abs_time[key] = (absolute_start_time, segment_obj) # Use abs start for sorting key
+            except Exception as calc_err:
+                 logger.error(f"[API Meet {internal_meeting_id}] Error calculating absolute time for DB segment {key} (UID: {session_uid}): {calc_err}")
+        else:
+            logger.warning(f"[API Meet {internal_meeting_id}] Missing session UID ({session_uid}) or start time for DB segment {key}. Cannot calculate absolute time.")
+            # Fallback: Use meeting creation time as rough offset? Or skip?
+            # Skipping for now to ensure accuracy, but could add fallback if needed.
+
+    # Process Redis segments (overwriting DB ones with same relative start_time)
     for start_time_str, segment_json in redis_segments_raw.items():
         try:
             segment_data = json.loads(segment_json)
-            # Ensure required keys are present before creating the object
-            if 'end_time' in segment_data and 'text' in segment_data:
-                merged_segments[start_time_str] = TranscriptionSegment(
-                    start_time=float(start_time_str),
-                    end_time=segment_data['end_time'],
-                    text=segment_data['text'],
-                    language=segment_data.get('language', 'en')
-                )
+            session_uid_from_redis = segment_data.get("session_uid") # Get UID stored in Redis
+            
+            # ---> START FIX: Handle potentially prefixed UID from Redis <-----
+            potential_session_key = session_uid_from_redis # Assume it's the correct key first
+            if session_uid_from_redis:
+                # Check for known prefixes and strip if found
+                # This assumes prefixes end with '_' (e.g., 'google_meet_', 'zoom_')
+                # Add other platform prefixes as needed
+                prefixes_to_check = [f"{p.value}_" for p in Platform]
+                for prefix in prefixes_to_check:
+                    if session_uid_from_redis.startswith(prefix):
+                        potential_session_key = session_uid_from_redis[len(prefix):]
+                        logger.debug(f"[API Meet {internal_meeting_id}] Stripped prefix '{prefix}' from Redis UID '{session_uid_from_redis}', using key '{potential_session_key}' for lookup.")
+                        break # Stop after first match
+            # ---> END FIX <-----
+
+            # Use the potentially corrected key for lookup
+            session_start = session_times.get(potential_session_key) 
+
+            # Original check using the potentially corrected key and original redis uid
+            if 'end_time' in segment_data and 'text' in segment_data and session_uid_from_redis and session_start:
+                try:
+                    # Ensure session_start is timezone-aware
+                    if session_start.tzinfo is None:
+                         session_start = session_start.replace(tzinfo=timezone.utc)
+                         
+                    relative_start_time = float(start_time_str)
+                    # Calculate absolute start and end times
+                    absolute_start_time = session_start + timedelta(seconds=relative_start_time)
+                    absolute_end_time = session_start + timedelta(seconds=segment_data['end_time'])
+
+                    segment_obj = TranscriptionSegment(
+                        start_time=relative_start_time,
+                        end_time=segment_data['end_time'],
+                        text=segment_data['text'],
+                        language=segment_data.get('language'), # Corrected previously
+                        # created_at will be None for Redis segments
+                        # ---> ADD Populate absolute times <----
+                        absolute_start_time=absolute_start_time,
+                        absolute_end_time=absolute_end_time
+                        # ---> END ADD <----
+                    )
+                    merged_segments_with_abs_time[start_time_str] = (absolute_start_time, segment_obj) # Overwrites if key exists, use abs start for sorting
+                except Exception as calc_err:
+                    logger.error(f"[API Meet {internal_meeting_id}] Error calculating absolute time for Redis segment {start_time_str} (UID: {session_uid_from_redis}): {calc_err}")
             else:
-                logger.warning(f"Skipping Redis segment {start_time_str} due to missing keys in meeting {internal_meeting_id}")
+                # Log reason for skipping
+                if not ('end_time' in segment_data and 'text' in segment_data):
+                     logger.warning(f"[API Meet {internal_meeting_id}] Skipping Redis segment {start_time_str} due to missing keys (end_time/text). JSON: {segment_json[:100]}...")
+                elif not session_uid_from_redis: # Check original UID from redis for logging
+                     logger.warning(f"[API Meet {internal_meeting_id}] Skipping Redis segment {start_time_str} due to missing session_uid in Redis data. JSON: {segment_json[:100]}...")
+                elif not session_start: # Check if lookup failed after potential stripping
+                     logger.warning(f"[API Meet {internal_meeting_id}] Skipping Redis segment {start_time_str} with original UID {session_uid_from_redis} (lookup key: {potential_session_key}) because session start time not found in DB.")
+                else: # Should not happen
+                     logger.warning(f"[API Meet {internal_meeting_id}] Skipping Redis segment {start_time_str} for unknown reason.")
+
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-            logger.error(f"Error parsing Redis segment {start_time_str} for meeting {internal_meeting_id}: {e}")
-            # Skip this segment
+            logger.error(f"[API Meet {internal_meeting_id}] Error parsing Redis segment {start_time_str}: {e}")
+
+    # 6. Sort based on calculated absolute time
+    # Values are tuples: (absolute_datetime, TranscriptionSegment_object)
+    sorted_segment_tuples = sorted(merged_segments_with_abs_time.values(), key=lambda item: item[0])
+
+    # Extract final segment objects from sorted tuples
+    sorted_segments = [segment_obj for abs_time, segment_obj in sorted_segment_tuples]
+    logger.info(f"[API Meet {internal_meeting_id}] Merged and sorted into {len(sorted_segments)} total segments based on absolute time.")
     
-    # Convert to sorted list
-    sorted_segments = sorted(merged_segments.values(), key=lambda s: s.start_time)
-    logger.info(f"Merged into {len(sorted_segments)} total segments for meeting {internal_meeting_id}")
-    
-    # 5. Construct the response using the found meeting and segments
+    # 7. Construct the response using the found meeting and segments
     meeting_details = MeetingResponse.from_orm(meeting)
 
     # Combine into the final response model
     response_data = meeting_details.dict() # Get meeting data as dict
-    response_data["segments"] = sorted_segments # Add merged segments list
+    response_data["segments"] = sorted_segments # Add correctly sorted segments list
 
     return TranscriptionResponse(**response_data)
 
@@ -756,29 +883,6 @@ async def get_user_by_token(token: str, db: AsyncSession) -> Optional[User]:
         logger.warning(f"Invalid API token provided in stream data: {token[:5]}...")
         # Raise specific error if token is invalid
         raise ValueError(f"Invalid API token") 
-    return user
-
-if __name__ == "__main__":
-    # Removed uvicorn runner, rely on Docker CMD
-    pass
-
-# ADD Helper for token validation (or ensure it exists in an auth.py)
-async def get_user_by_token(token: str, db: AsyncSession) -> Optional[User]:
-    """Validates an API token and returns the associated User or raises HTTPException."""
-    if not token:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing API token")
-    
-    result = await db.execute(
-        select(User).join(APIToken).where(APIToken.token == token)
-    )
-    user = result.scalars().first()
-    
-    if not user:
-        logger.warning(f"Invalid API token provided in WebSocket handshake: {token[:5]}...")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid API token"
-        )
     return user
 
 if __name__ == "__main__":

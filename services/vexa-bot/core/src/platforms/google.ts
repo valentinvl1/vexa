@@ -174,11 +174,12 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
         (window as any).logBot(`Successfully combined ${sourcesConnected} audio streams.`);
 
         // Ensure meetingUrl is not null before using btoa
-        const uniquePart = connectionId || btoa(nativeMeetingId || meetingUrl || ''); // Added || '' fallback for null meetingUrl
-        const structuredId = `${platform}_${uniquePart}`;
+        // const uniquePart = connectionId || btoa(nativeMeetingId || meetingUrl || ''); // Added || '' fallback for null meetingUrl
+        // const structuredId = `${platform}_${uniquePart}`; // <-- REMOVE THIS LINE
+        const sessionUid = connectionId; // <-- USE connectionId DIRECTLY
 
         const wsUrl = "ws://whisperlive:9090";
-        (window as any).logBot(`Attempting to connect WebSocket to: ${wsUrl} with platform: ${platform}`);
+        (window as any).logBot(`Attempting to connect WebSocket to: ${wsUrl} with platform: ${platform}, session UID: ${sessionUid}`); // Log the correct UID
         
         let socket: WebSocket | null = null;
         let isServerReady = false;
@@ -209,7 +210,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
                 // Ensure platform, token, nativeMeetingId, meetingUrl are correctly passed
                 // into the page.evaluate scope from the outer botConfig
                 const handshakePayload = {
-                    uid: structuredId,       // From earlier construction based on nativeMeetingId/connectionId
+                    uid: sessionUid,       // <-- USE sessionUid directly
                     language: null,          // *** CHANGED from "ru" to null ***
                     task: "transcribe",     // Literal value - Ensure this is required
                     model: "medium",       // Literal value or from config if needed
@@ -231,7 +232,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             socket.onmessage = (event) => {
               (window as any).logBot("Received message: " + event.data);
               const data = JSON.parse(event.data);
-              if (data["uid"] !== structuredId) return;
+              if (data["uid"] !== sessionUid) return; // <-- Check against sessionUid
               if (data["status"] === "ERROR") {
                  (window as any).logBot(`WebSocket Server Error: ${data["message"]}`);
               } else if (data["status"] === "WAIT") {

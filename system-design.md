@@ -161,6 +161,24 @@ The system is composed of the following services:
 *   **`traefik.toml`**: Configuration file for the `traefik` service, mounted read-only. Defines entrypoints, providers, etc.
 *   **`filter_config.py`**: Optional Python file used by `transcription-collector` (specifically `filters.py`) to load custom filtering rules, patterns, and stopwords for the background persistence task.
 
+## Data Schemas (Pydantic)
+
+Based on imports in `transcription-collector` (likely defined in `shared_models/schemas.py`):
+
+*   **`Platform` (Enum)**: Defines the supported meeting platforms (e.g., `google_meet`, `zoom`). Used in API paths (`/transcripts/{platform}/...`) and internal meeting records.
+*   **`TranscriptionSegment`**: Represents a single segment of a transcription. Key fields likely include:
+    *   `start_time` (float)
+    *   `end_time` (float)
+    *   `text` (str)
+    *   `language` (Optional[str])
+    Used as the primary unit of transcription data within responses and internal processing.
+*   **`MeetingResponse`**: Represents the metadata for a meeting record, likely mirroring the `Meeting` database model. Used within `MeetingListResponse` and embedded in `TranscriptionResponse`.
+*   **`MeetingListResponse`**: Response model for the `/meetings` endpoint. Contains a list of `MeetingResponse` objects.
+*   **`TranscriptionResponse`**: The main response model for the `/transcripts/...` endpoint. It likely inherits fields from `MeetingResponse` and adds a `segments` field containing a list of `TranscriptionSegment` objects.
+*   **`HealthResponse`**: Response model for the `/health` endpoint. Contains status fields for the service itself, Redis, and the database.
+*   **`ErrorResponse`**: (Imported but potentially unused or used implicitly by FastAPI) Standard structure for returning error details.
+*   **`WhisperLiveData`**: (Imported but not directly used for stream parsing) Represents the expected structure of the *entire payload* coming from WhisperLive *before* it's processed segment by segment by the collector. Might contain fields like `uid`, `platform`, `meeting_id`, `token`, and a list of raw segment dictionaries.
+
 ## Data Flow (Transcription Example)
 
 **WhisperLive Publishing:**

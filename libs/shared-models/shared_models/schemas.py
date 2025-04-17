@@ -188,6 +188,8 @@ class TranscriptionSegment(BaseModel):
     language: Optional[str]
     created_at: Optional[datetime]
     speaker: Optional[str] = None
+    absolute_start_time: Optional[datetime] = Field(None, description="Absolute start timestamp of the segment (UTC)")
+    absolute_end_time: Optional[datetime] = Field(None, description="Absolute end timestamp of the segment (UTC)")
 
     class Config:
         orm_mode = True
