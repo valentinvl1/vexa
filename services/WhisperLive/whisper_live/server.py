@@ -25,6 +25,10 @@ import http.server
 import socketserver
 import threading
 
+# Import Redis
+import redis
+import uuid
+
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 
@@ -40,81 +44,114 @@ logger = logging.getLogger("transcription")
 logger.setLevel(logging.INFO)
 logger.addHandler(file_handler)
 
-# Transcription Collector client
+# Transcription Collector client using Redis Streams
 class TranscriptionCollectorClient:
-    def __init__(self, collector_url):
-        self.collector_url = collector_url
-        self.ws = None
+    def __init__(self, collector_url=None):
+        # Parse collector URL to extract configuration
+        # Expected format: redis://hostname:port/db#/stream_name
+        # If not provided or invalid, use default values
+        self.redis_host = os.environ.get("REDIS_HOST", "redis")
+        self.redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+        self.redis_db = int(os.environ.get("REDIS_DB", "0"))
+        self.stream_name = os.environ.get("REDIS_STREAM_NAME", "transcription_segments")
+        
+        # If collector_url is provided in redis:// format, parse it
+        if collector_url and collector_url.startswith("redis://"):
+            try:
+                # Parse redis://hostname:port/db/stream
+                parts = collector_url.replace("redis://", "").split("/")
+                host_port = parts[0].split(":")
+                self.redis_host = host_port[0]
+                if len(host_port) > 1:
+                    self.redis_port = int(host_port[1])
+                if len(parts) > 1 and parts[1]:
+                    self.redis_db = int(parts[1])
+                if len(parts) > 2:
+                    self.stream_name = parts[2]
+            except Exception as e:
+                logging.error(f"Failed to parse Redis URL {collector_url}: {e}")
+        
+        self.redis_client = None
         self.connected = False
-        self.reconnect_thread = None
         self.connect()
     
     def connect(self):
         try:
-            self.ws = websocket.WebSocketApp(
-                self.collector_url,
-                on_open=self._on_open,
-                on_close=self._on_close,
-                on_error=self._on_error
+            self.redis_client = redis.Redis(
+                host=self.redis_host,
+                port=self.redis_port,
+                db=self.redis_db,
+                decode_responses=True
             )
-            threading.Thread(target=self.ws.run_forever, daemon=True).start()
+            # Test connection
+            self.redis_client.ping()
+            self.connected = True
+            logging.info(f"Connected to Redis at {self.redis_host}:{self.redis_port}/{self.redis_db}, stream: {self.stream_name}")
         except Exception as e:
-            logging.error(f"Error connecting to collector: {e}")
-            self._schedule_reconnect()
-    
-    def _on_open(self, ws):
-        self.connected = True
-        logging.info("Connected to transcription collector")
-    
-    def _on_close(self, ws, close_status_code, close_msg):
-        self.connected = False
-        logging.info("Disconnected from transcription collector")
-        self._schedule_reconnect()
-    
-    def _on_error(self, ws, error):
-        logging.error(f"Collector connection error: {error}")
-        self.connected = False
-        self._schedule_reconnect()
-    
-    def _schedule_reconnect(self):
-        if self.reconnect_thread is None or not self.reconnect_thread.is_alive():
-            self.reconnect_thread = threading.Timer(5.0, self.connect)
-            self.reconnect_thread.daemon = True
-            self.reconnect_thread.start()
+            logging.error(f"Error connecting to Redis: {e}")
+            self.connected = False
+            # Schedule reconnection
+            threading.Timer(5.0, self.connect).start()
     
     def send_transcription(self, data):
-        if self.connected and self.ws:
-            try:
-                # Validate required fields
-                if "uid" not in data or not data["uid"]:
-                    logging.error("Cannot send transcription: missing client uid")
+        if not self.connected or not self.redis_client:
+            logging.warning("Cannot send transcription: Redis not connected")
+            return
+        
+        try:
+            # Validate required fields
+            if "uid" not in data or not data["uid"]:
+                logging.error("Cannot send transcription: missing client uid")
+                return
+            
+            if "segments" not in data or not data["segments"]:
+                logging.error(f"Cannot send transcription: missing segments for client {data['uid']}")
+                return
+            
+            # Validate critical fields
+            required_fields = ["platform", "meeting_url", "token", "meeting_id"]
+            for field in required_fields:
+                if field not in data or not data[field]:
+                    logging.error(f"Cannot send transcription: missing {field} for client {data['uid']}")
                     return
-                
-                if "segments" not in data or not data["segments"]:
-                    logging.error(f"Cannot send transcription: missing segments for client {data['uid']}")
-                    return
-                
-                # Validate critical fields
-                required_fields = ["platform", "meeting_url", "token"]
-                for field in required_fields:
-                    if field not in data or not data[field]:
-                        logging.error(f"Cannot send transcription: missing {field} for client {data['uid']}")
-                        return
-                
-                # Send validated data
-                self.ws.send(json.dumps(data))
-                logging.debug(f"Sent transcription for client {data['uid']} with {len(data['segments'])} segments")
-            except Exception as e:
-                logging.error(f"Error sending to collector: {e}")
+            
+            # Add generation timestamp to the data
+            data["generated_at"] = datetime.datetime.utcnow().isoformat() + "Z"  # ISO format with UTC indicator
+            
+            # Publish to Redis Stream
+            message_json = json.dumps(data)
+            message_id = self.redis_client.xadd(
+                self.stream_name,
+                {"payload": message_json}
+            )
+            logging.debug(f"Published transcription with {len(data['segments'])} segments to Redis Stream, message ID: {message_id}")
+        except Exception as e:
+            logging.error(f"Error sending to Redis Stream: {e}")
+            # Try to reconnect on failure
+            if not self.connected:
+                self.connect()
 
 # Initialize collector client
 collector_client = None
 collector_url = os.environ.get("TRANSCRIPTION_COLLECTOR_URL")
-if collector_url:
-    logging.info(f"Initializing transcription collector client to {collector_url}")
-    collector_client = TranscriptionCollectorClient(collector_url)
+redis_stream_url = os.environ.get("REDIS_STREAM_URL")
+
+# Prefer REDIS_STREAM_URL if available, otherwise try to use TRANSCRIPTION_COLLECTOR_URL
+if redis_stream_url:
+    logging.info(f"Initializing transcription collector client with Redis Stream URL: {redis_stream_url}")
+    collector_client = TranscriptionCollectorClient(redis_stream_url)
+elif collector_url:
+    # For backward compatibility, if the URL is not a Redis URL, log a warning
+    if not collector_url.startswith("redis://"):
+        logging.warning(f"WebSocket URL detected: {collector_url}. Should migrate to Redis Stream URL format.")
+        # Still initialize with default Redis settings
+        collector_client = TranscriptionCollectorClient()
+    else:
+        logging.info(f"Initializing transcription collector client with URL: {collector_url}")
+        collector_client = TranscriptionCollectorClient(collector_url)
 else:
-    logging.info("No transcription collector URL provided, skipping collector integration")
+    logging.info("No Redis Stream URL provided, initializing with default settings")
+    collector_client = TranscriptionCollectorClient()
 
 class ClientManager:
     def __init__(self, max_clients=4, max_connection_time=600):
@@ -820,13 +857,17 @@ class ServeClientBase(object):
     def forward_to_collector(self, segments):
         """Forward transcriptions to the collector if available"""
         if collector_client and segments:
+            # Generate a unique message ID to track the group of segments
+            message_group_id = str(uuid.uuid4())
+            
             data = {
                 "uid": self.client_uid,
                 "platform": self.platform,
                 "meeting_url": self.meeting_url,
                 "token": self.token,
                 "meeting_id": self.meeting_id,
-                "segments": segments
+                "segments": segments,
+                "message_group_id": message_group_id
             }
             collector_client.send_transcription(data)
 

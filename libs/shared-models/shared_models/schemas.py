@@ -238,6 +238,7 @@ class HealthResponse(BaseModel):
     status: str
     redis: str
     database: str
+    stream: Optional[str] = None
     timestamp: datetime
 
 class ErrorResponse(BaseModel):
