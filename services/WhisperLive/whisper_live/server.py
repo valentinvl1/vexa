@@ -46,90 +46,250 @@ logger.addHandler(file_handler)
 
 # Transcription Collector client using Redis Streams
 class TranscriptionCollectorClient:
-    def __init__(self, collector_url=None):
-        # Parse collector URL to extract configuration
-        # Expected format: redis://hostname:port/db#/stream_name
-        # If not provided or invalid, use default values
-        self.redis_host = os.environ.get("REDIS_HOST", "redis")
-        self.redis_port = int(os.environ.get("REDIS_PORT", "6379"))
-        self.redis_db = int(os.environ.get("REDIS_DB", "0"))
-        self.stream_name = os.environ.get("REDIS_STREAM_NAME", "transcription_segments")
+    """Client that maintains connection to Redis on a separate thread
+    and attempts auto-reconnection when the connection is lost."""
+
+    def __init__(self, redis_stream_url=None):
+        """Initialize client with redis connection URL.
+        The connection will be established in a separate thread
+        when connect() is called.
         
-        # If collector_url is provided in redis:// format, parse it
-        if collector_url and collector_url.startswith("redis://"):
-            try:
-                # Parse redis://hostname:port/db/stream
-                parts = collector_url.replace("redis://", "").split("/")
-                host_port = parts[0].split(":")
-                self.redis_host = host_port[0]
-                if len(host_port) > 1:
-                    self.redis_port = int(host_port[1])
-                if len(parts) > 1 and parts[1]:
-                    self.redis_db = int(parts[1])
-                if len(parts) > 2:
-                    self.stream_name = parts[2]
-            except Exception as e:
-                logging.error(f"Failed to parse Redis URL {collector_url}: {e}")
+        Args:
+            redis_stream_url: URL to redis server with the stream
+        """
+        # Use provided URL or environment variable with fallback to localhost
+        self.redis_url = (
+            redis_stream_url or 
+            os.getenv("REDIS_STREAM_URL") or 
+            "redis://localhost:6379/0"
+        )
         
         self.redis_client = None
-        self.connected = False
+        self.is_connected = False
+        self.connection_lock = threading.Lock()
+        self.connection_thread = None
+        self.stop_requested = False
+        
+        # Stream key for transcriptions
+        self.stream_key = os.getenv("REDIS_STREAM_KEY", "transcription_segments")
+        
+        # Track session_uids for which we've published session_start events
+        self.session_starts_published = set()
+        
+        # Connect on initialization 
         self.connect()
-    
+
     def connect(self):
-        try:
-            self.redis_client = redis.Redis(
-                host=self.redis_host,
-                port=self.redis_port,
-                db=self.redis_db,
-                decode_responses=True
+        """Connect to Redis in a separate thread with auto-reconnection."""
+        with self.connection_lock:
+            if self.connection_thread and self.connection_thread.is_alive():
+                logging.info("Connection thread already running.")
+                return
+                
+            self.stop_requested = False
+            self.connection_thread = threading.Thread(
+                target=self._connection_worker,
+                daemon=True
             )
-            # Test connection
-            self.redis_client.ping()
-            self.connected = True
-            logging.info(f"Connected to Redis at {self.redis_host}:{self.redis_port}/{self.redis_db}, stream: {self.stream_name}")
-        except Exception as e:
-            logging.error(f"Error connecting to Redis: {e}")
-            self.connected = False
-            # Schedule reconnection
-            threading.Timer(5.0, self.connect).start()
+            self.connection_thread.start()
+            logging.info("Started connection thread.")
+
+    def _connection_worker(self):
+        """Worker thread that establishes and maintains Redis connection.
+        Handles automatic reconnection with exponential backoff."""
+        retry_delay = 1  # Initial retry delay in seconds
+        max_retry_delay = 30  # Maximum retry delay
+        
+        while not self.stop_requested:
+            try:
+                # Parse Redis URL
+                logging.info(f"Connecting to Redis at {self.redis_url}")
+                self.redis_client = redis.from_url(
+                    self.redis_url,
+                    decode_responses=True
+                )
+                
+                # Test connection
+                self.redis_client.ping()
+                
+                with self.connection_lock:
+                    self.is_connected = True
+                
+                logging.info(f"Connected to Redis, stream key: {self.stream_key}")
+                
+                # Reset retry delay on successful connection
+                retry_delay = 1
+                
+                # Keep connection alive
+                while not self.stop_requested:
+                    # Ping Redis to keep connection alive and check health
+                    self.redis_client.ping()
+                    time.sleep(5)  # Check connection every 5 seconds
+                
+            except redis.ConnectionError as e:
+                logging.error(f"Redis connection error: {e}")
+                with self.connection_lock:
+                    self.is_connected = False
+                    self.redis_client = None
+                
+            except Exception as e:
+                logging.error(f"Redis error: {e}")
+                with self.connection_lock:
+                    self.is_connected = False
+                    self.redis_client = None
+            
+            # Don't retry if stop was requested
+            if self.stop_requested:
+                break
+                
+            # Exponential backoff for retries
+            logging.info(f"Retrying connection in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
     
-    def send_transcription(self, data):
-        if not self.connected or not self.redis_client:
-            logging.warning("Cannot send transcription: Redis not connected")
-            return
+    def disconnect(self):
+        """Disconnect from Redis and stop the connection thread."""
+        with self.connection_lock:
+            self.stop_requested = True
+            self.is_connected = False
+            
+            if self.redis_client:
+                try:
+                    self.redis_client.close()
+                except Exception as e:
+                    logging.error(f"Error closing Redis connection: {e}")
+                self.redis_client = None
+            
+        # Wait for thread to terminate
+        if self.connection_thread and self.connection_thread.is_alive():
+            self.connection_thread.join(timeout=5.0)
+            logging.info("Disconnected from Redis")
+
+    def publish_session_start_event(self, token, platform, meeting_id, session_uid):
+        """Publish a session_start event to the Redis stream.
+        
+        Args:
+            token: User's API token
+            platform: Platform identifier (e.g., 'google_meet') 
+            meeting_id: Platform-specific meeting ID
+            session_uid: Unique identifier for this session
+        
+        Returns:
+            Boolean indicating success or failure
+        """
+        if session_uid in self.session_starts_published:
+            logging.debug(f"Session start already published for {session_uid}")
+            return True
+            
+        # Check connection
+        if not self.is_connected or not self.redis_client:
+            logging.warning("Cannot publish session_start: Not connected to Redis")
+            return False
+            
+        # Validate required fields
+        if not all([token, platform, meeting_id, session_uid]):
+            logging.error("Missing required fields for session_start event")
+            return False
+            
+        try:
+            # Create event payload with ISO 8601 timestamp
+            now = datetime.datetime.utcnow()
+            timestamp_iso = now.isoformat() + "Z"
+            
+            payload = {
+                "type": "session_start",
+                "token": token,
+                "platform": platform,
+                "meeting_id": meeting_id,
+                "uid": session_uid,
+                "start_timestamp": timestamp_iso
+            }
+            
+            # Publish to Redis stream
+            message = {
+                "payload": json.dumps(payload)
+            }
+            
+            result = self.redis_client.xadd(
+                self.stream_key,
+                message
+            )
+            
+            if result:
+                logging.info(f"Published session_start event for session {session_uid}")
+                # Mark this session as having a published start event
+                self.session_starts_published.add(session_uid)
+                return True
+            else:
+                logging.error(f"Failed to publish session_start event for {session_uid}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error publishing session_start event: {e}")
+            return False
+
+    def send_transcription(self, token, platform, meeting_id, segments, session_uid=None):
+        """Send transcription segments to Redis stream.
+        
+        Args:
+            token: User's API token
+            platform: Platform identifier (e.g., 'google_meet') 
+            meeting_id: Platform-specific meeting ID
+            segments: List of transcription segments
+            session_uid: Optional unique identifier for this session
+            
+        Returns:
+            Boolean indicating success or failure
+        """
+        # Check connection
+        if not self.is_connected or not self.redis_client:
+            logging.warning("Cannot send transcription: Not connected to Redis")
+            return False
+            
+        # Validate required fields
+        if not all([token, platform, meeting_id, segments]):
+            logging.error("Missing required fields for transcription")
+            return False
+            
+        # Generate a session_uid if not provided
+        if not session_uid:
+            session_uid = str(uuid.uuid4())
+            
+        # If this is the first time we're seeing this session_uid, publish a session_start event
+        if session_uid not in self.session_starts_published:
+            self.publish_session_start_event(token, platform, meeting_id, session_uid)
         
         try:
-            # Validate required fields
-            if "uid" not in data or not data["uid"]:
-                logging.error("Cannot send transcription: missing client uid")
-                return
+            # Create payload
+            payload = {
+                "type": "transcription",
+                "token": token,
+                "platform": platform, 
+                "meeting_id": meeting_id,
+                "segments": segments,
+                "uid": session_uid  # Include session_uid in transcription messages too
+            }
             
-            if "segments" not in data or not data["segments"]:
-                logging.error(f"Cannot send transcription: missing segments for client {data['uid']}")
-                return
+            # Publish to Redis stream
+            message = {
+                "payload": json.dumps(payload)
+            }
             
-            # Validate critical fields
-            required_fields = ["platform", "meeting_url", "token", "meeting_id"]
-            for field in required_fields:
-                if field not in data or not data[field]:
-                    logging.error(f"Cannot send transcription: missing {field} for client {data['uid']}")
-                    return
-            
-            # Add generation timestamp to the data
-            data["generated_at"] = datetime.datetime.utcnow().isoformat() + "Z"  # ISO format with UTC indicator
-            
-            # Publish to Redis Stream
-            message_json = json.dumps(data)
-            message_id = self.redis_client.xadd(
-                self.stream_name,
-                {"payload": message_json}
+            result = self.redis_client.xadd(
+                self.stream_key,
+                message
             )
-            logging.debug(f"Published transcription with {len(data['segments'])} segments to Redis Stream, message ID: {message_id}")
+            
+            if result:
+                logging.debug(f"Published transcription with {len(segments)} segments")
+                return True
+            else:
+                logging.error("Failed to publish transcription")
+                return False
+                
         except Exception as e:
-            logging.error(f"Error sending to Redis Stream: {e}")
-            # Try to reconnect on failure
-            if not self.connected:
-                self.connect()
+            logging.error(f"Error publishing transcription: {e}")
+            return False
 
 # Initialize collector client
 collector_client = None
@@ -639,11 +799,13 @@ class ServeClientBase(object):
         self.websocket = websocket
         self.language = language
         self.task = task
-        self.client_uid = client_uid
+        self.client_uid = client_uid or str(uuid.uuid4())
         self.platform = platform
         self.meeting_url = meeting_url
         self.token = token
         self.meeting_id = meeting_id
+        
+        # Restore all the original instance variables that were deleted
         self.transcription_buffer = TranscriptionBuffer(self.client_uid)
         self.model = None
         self.is_multilingual = True
@@ -667,6 +829,17 @@ class ServeClientBase(object):
 
         # threading
         self.lock = threading.Lock()
+        
+        # Send SERVER_READY message
+        ready_message = json.dumps({"status": self.SERVER_READY, "uid": self.client_uid})
+        logging.info(f"Client {self.client_uid} connected. Sending SERVER_READY.")
+        self.websocket.send(ready_message)
+        
+        # Publish session_start event first if using Redis collector
+        if collector_client and all([platform, meeting_url, token, meeting_id]):
+            # Publish session start event
+            collector_client.publish_session_start_event(token, platform, meeting_id, self.client_uid)
+            logging.info(f"Published session_start event for client {self.client_uid}")
 
     def speech_to_text(self):
         raise NotImplementedError
@@ -802,16 +975,14 @@ class ServeClientBase(object):
             # Send to transcription collector if available
             global collector_client
             if collector_client:
-                # Include platform, meeting_url, and token in data sent to collector
-                collector_data = {
-                    "uid": self.client_uid,
-                    "platform": self.platform,  # Must be properly set now
-                    "meeting_url": self.meeting_url,  # Must be properly set now
-                    "token": self.token,  # Must be properly set now
-                    "meeting_id": self.meeting_id,  # Include meeting_id in the data
-                    "segments": segments
-                }
-                collector_client.send_transcription(collector_data)
+                # Send transcription to Redis stream
+                collector_client.send_transcription(
+                    token=self.token,
+                    platform=self.platform,
+                    meeting_id=self.meeting_id,
+                    segments=segments,
+                    session_uid=self.client_uid
+                )
             
             # Log the transcription data to file with more detailed formatting
             formatted_segments = []
@@ -857,19 +1028,14 @@ class ServeClientBase(object):
     def forward_to_collector(self, segments):
         """Forward transcriptions to the collector if available"""
         if collector_client and segments:
-            # Generate a unique message ID to track the group of segments
-            message_group_id = str(uuid.uuid4())
-            
-            data = {
-                "uid": self.client_uid,
-                "platform": self.platform,
-                "meeting_url": self.meeting_url,
-                "token": self.token,
-                "meeting_id": self.meeting_id,
-                "segments": segments,
-                "message_group_id": message_group_id
-            }
-            collector_client.send_transcription(data)
+            # Send transcription to collector
+            collector_client.send_transcription(
+                token=self.token,
+                platform=self.platform,
+                meeting_id=self.meeting_id,
+                segments=segments,
+                session_uid=self.client_uid
+            )
 
 
 class ServeClientTensorRT(ServeClientBase):

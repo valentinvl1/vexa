@@ -181,6 +181,19 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
         payload_json = message_data['payload']
         stream_data = json.loads(payload_json)
 
+        # Check message type to determine how to process
+        message_type = stream_data.get("type", "transcription")  # Default to transcription for backward compatibility
+        
+        # Process different message types
+        if message_type == "session_start":
+            return await process_session_start_event(message_id, stream_data)
+        elif message_type == "transcription":
+            # Continue with normal transcription processing below
+            pass
+        else:
+            logger.warning(f"Message {message_id} has unknown type '{message_type}'. Skipping.")
+            return True  # Unknown type, OK to ACK
+            
         # 2. Validate required fields
         required_fields = ["platform", "meeting_id", "token", "segments"]
         if not all(field in stream_data for field in required_fields):
@@ -321,6 +334,105 @@ async def process_stream_message(message_id: str, message_data: Dict[str, Any]) 
         logger.error(f"Unexpected error in process_stream_message for {message_id}: {e}", exc_info=True)
         return False # Unexpected error, DO NOT ACK
 
+# --- Helper function for processing session_start events ---
+async def process_session_start_event(message_id: str, stream_data: Dict[str, Any]) -> bool:
+    """Processes a session_start event from the Redis stream.
+    
+    Updates the MeetingSession database record with the accurate start time.
+    
+    Returns True if processing is considered complete (can be ACKed), 
+    False if a potentially recoverable error occurred (should not be ACKed).
+    """
+    try:
+        # 1. Validate required fields for session_start
+        required_fields = ["platform", "meeting_id", "token", "uid", "start_timestamp"]
+        if not all(field in stream_data for field in required_fields):
+            logger.warning(f"Session start message {message_id} missing required fields. Skipping. Required: {required_fields}")
+            return True  # Handled error, OK to ACK
+            
+        # 2. Validate Token, Get User, Find Meeting ID
+        user: Optional[User] = None
+        meeting: Optional[Meeting] = None
+        
+        async with async_session_local() as db:
+            try:
+                # Use helper to get user, raises ValueError on failure
+                user = await get_user_by_token(stream_data['token'], db)
+                
+                # Find meeting
+                stmt_meeting = select(Meeting).where(
+                    Meeting.user_id == user.id,
+                    Meeting.platform == stream_data['platform'],
+                    Meeting.platform_specific_id == stream_data['meeting_id']
+                ).order_by(Meeting.created_at.desc())
+                result_meeting = await db.execute(stmt_meeting)
+                meeting = result_meeting.scalars().first()
+
+                if not meeting:
+                    logger.warning(f"Meeting lookup failed for session_start message {message_id}: "
+                                  f"No meeting found for user {user.id}, platform '{stream_data['platform']}', "
+                                  f"native ID '{stream_data['meeting_id']}'")
+                    return True  # Persistent data issue, OK to ACK
+                
+                # 3. Parse the start timestamp
+                start_timestamp_str = stream_data['start_timestamp']
+                try:
+                    # Parse ISO format timestamp
+                    if start_timestamp_str.endswith('Z'):
+                        # Remove Z and handle as UTC
+                        start_timestamp_str = start_timestamp_str[:-1]
+                    start_timestamp = datetime.fromisoformat(start_timestamp_str)
+                except ValueError as e:
+                    logger.warning(f"Invalid timestamp format in session_start message {message_id}: {e}")
+                    return True  # Bad data, OK to ACK
+                
+                # 4. Update the meeting's session start time
+                # Find or create a MeetingSession record for this session
+                session_uid = stream_data['uid']
+                stmt_session = select(MeetingSession).where(
+                    MeetingSession.meeting_id == meeting.id,
+                    MeetingSession.session_uid == session_uid
+                )
+                result_session = await db.execute(stmt_session)
+                meeting_session = result_session.scalars().first()
+                
+                if meeting_session:
+                    # Update existing session
+                    meeting_session.session_start_time = start_timestamp
+                    logger.info(f"Updated start time for existing session {session_uid}, "
+                              f"meeting_id {meeting.id} to {start_timestamp}")
+                else:
+                    # Create new session
+                    meeting_session = MeetingSession(
+                        meeting_id=meeting.id,
+                        session_uid=session_uid,
+                        session_start_time=start_timestamp
+                    )
+                    db.add(meeting_session)
+                    logger.info(f"Created new session {session_uid} for meeting_id {meeting.id} "
+                              f"with start time {start_timestamp}")
+                
+                # Commit the changes
+                await db.commit()
+                
+                logger.info(f"Successfully processed session_start event for meeting {meeting.id}, "
+                          f"session {session_uid}, start time: {start_timestamp}")
+                return True
+                
+            except ValueError as ve:
+                # Specific errors from token/meeting lookup
+                logger.warning(f"Auth/Lookup failed for session_start message {message_id}: {ve}. Skipping.")
+                return True  # Persistent data issue, OK to ACK
+            except Exception as db_err:
+                # Generic DB or other errors during lookup phase
+                logger.error(f"DB/Lookup error processing session_start message {message_id}: {db_err}", exc_info=True)
+                return False  # Potentially recoverable DB error, DO NOT ACK
+    
+    except Exception as e:
+        # Catch-all for unexpected errors
+        logger.error(f"Unexpected error in process_session_start_event for {message_id}: {e}", exc_info=True)
+        return False  # Unexpected error, DO NOT ACK
+
 # --- Function to claim and process stale messages ---
 async def claim_stale_messages():
     claim_start_id = '0-0' # Start claiming from the beginning of time
@@ -362,7 +474,7 @@ async def claim_stale_messages():
             # 2. Filter by idle time
             stale_candidates = [
                 msg for msg in pending_details
-                if msg['idle'] > PENDING_MSG_TIMEOUT_MS
+                if msg.get('idle', 0) > PENDING_MSG_TIMEOUT_MS
             ]
 
             if not stale_candidates:
