@@ -127,7 +127,7 @@ class VexaClient:
 
     # --- Bot Management ---
 
-    def request_bot(self, platform: str, native_meeting_id: str, bot_name: Optional[str] = None) -> Dict[str, Any]:
+    def request_bot(self, platform: str, native_meeting_id: str, bot_name: Optional[str] = None, language: Optional[str] = None, task: Optional[str] = None) -> Dict[str, Any]:
         """
         Requests a new bot to join a meeting using platform and native ID.
 
@@ -135,13 +135,23 @@ class VexaClient:
             platform: Platform identifier (e.g., 'google_meet', 'zoom').
             native_meeting_id: The platform-specific meeting identifier.
             bot_name: Optional name for the bot in the meeting.
+            language: Optional language code for transcription (e.g., 'en', 'es').
+            task: Optional transcription task ('transcribe' or 'translate').
 
         Returns:
             Dictionary representing the created/updated Meeting object.
         """
-        payload = {"platform": platform, "native_meeting_id": native_meeting_id}
+        payload = {
+            "platform": platform, 
+            "native_meeting_id": native_meeting_id
+        }
         if bot_name:
             payload["bot_name"] = bot_name
+        if language:
+            payload["language"] = language
+        if task:
+            payload["task"] = task
+            
         return self._request("POST", "/bots", api_type='user', json_data=payload)
 
     def stop_bot(self, platform: str, native_meeting_id: str) -> Dict[str, str]:
@@ -318,7 +328,17 @@ if __name__ == "__main__":
         # 1. Request the bot
         print(f"\n1. Requesting bot for {platform} / {native_meeting_id}...")
         try:
-            meeting_response = user_client.request_bot(platform=platform, native_meeting_id=native_meeting_id, bot_name="E2ETestBot")
+            # Example: Request with specific language and task
+            meeting_response = user_client.request_bot(
+                platform=platform, 
+                native_meeting_id=native_meeting_id, 
+                bot_name="E2ETestBot",
+                language="en",  # Example: Specify language
+                task="transcribe"  # Example: Specify task
+            )
+            # Alternatively, call without language/task to use defaults:
+            # meeting_response = user_client.request_bot(platform=platform, native_meeting_id=native_meeting_id, bot_name="E2ETestBot")
+            
             print(f"   Request Bot Response: {meeting_response}")
             if meeting_response.get('id') and meeting_response.get('status') in ['requested', 'active']:
                  print("   Bot requested successfully.")

@@ -20,6 +20,7 @@ from shared_models.models import MeetingSession
 DOCKER_HOST = os.environ.get("DOCKER_HOST", "unix://var/run/docker.sock")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "vexa_default")
 BOT_IMAGE_NAME = os.environ.get("BOT_IMAGE", "vexa-bot:latest")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 logger = logging.getLogger("bot_manager.docker_utils")
 
@@ -120,8 +121,10 @@ def start_bot_container(
     meeting_url: Optional[str],
     platform: str, # External name (e.g., google_meet)
     bot_name: Optional[str],
-    user_token: str, # *** ADDED ***
-    native_meeting_id: str # *** ADDED ***
+    user_token: str,
+    native_meeting_id: str,
+    language: Optional[str],
+    task: Optional[str]
 ) -> Optional[tuple[str, str]]:
     """
     Starts a vexa-bot container via requests_unixsocket.
@@ -133,6 +136,8 @@ def start_bot_container(
         bot_name: An optional name for the bot inside the meeting.
         user_token: The API token of the user requesting the bot.
         native_meeting_id: The platform-specific meeting ID (e.g., 'xyz-abc-pdq').
+        language: Optional language code for transcription.
+        task: Optional transcription task ('transcribe' or 'translate').
         
     Returns:
         A tuple (container_id, connection_id) if successful, None otherwise.
@@ -150,22 +155,27 @@ def start_bot_container(
     connection_id = str(uuid.uuid4())
     logger.info(f"Generated unique connectionId for bot session: {connection_id}")
 
-    # Construct BOT_CONFIG JSON - Use external platform name directly
+    # Construct BOT_CONFIG JSON - Include new fields
     bot_config_data = {
-        "meeting_id": meeting_id,         # Keep internal ID 
-        "platform": platform,             # Use original external platform name
+        "meeting_id": meeting_id,
+        "platform": platform,
         "meetingUrl": meeting_url,
         "botName": bot_name,
-        "token": user_token,              # Use the passed user_token
-        "nativeMeetingId": native_meeting_id, # Use the passed native_meeting_id
-        "connectionId": connection_id,      # *** Use generated unique ID ***
+        "token": user_token,
+        "nativeMeetingId": native_meeting_id,
+        "connectionId": connection_id,
+        "language": language,
+        "task": task,
+        "redisUrl": REDIS_URL,
         "automaticLeave": {
             "waitingRoomTimeout": 300000,
             "noOneJoinedTimeout": 300000,
             "everyoneLeftTimeout": 300000
         }
     }
-    bot_config_json = json.dumps(bot_config_data)
+    # Remove keys with None values before serializing
+    cleaned_config_data = {k: v for k, v in bot_config_data.items() if v is not None}
+    bot_config_json = json.dumps(cleaned_config_data)
 
     logger.info(f"Bot config: {bot_config_json}") # Log the full config
 

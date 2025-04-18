@@ -146,7 +146,9 @@ async def request_bot(
             platform=req.platform.value,     # Platform string
             bot_name=req.bot_name,
             user_token=user_token,           # *** ADDED: Pass the user's API token ***
-            native_meeting_id=native_meeting_id # *** ADDED: Pass the native meeting ID ***
+            native_meeting_id=native_meeting_id, # *** ADDED: Pass the native meeting ID ***
+            language=req.language,           # *** ADDED: Pass language ***
+            task=req.task                    # *** ADDED: Pass task ***
         )
         logger.info(f"Call to start_bot_container completed. Container ID: {container_id}, Connection ID: {connection_id}") # Log both IDs
 

@@ -157,9 +157,22 @@ class MeetingBase(BaseModel):
 
     # Removed get_bot_platform method, use Platform.get_bot_name(self.platform.value) if needed
 
-class MeetingCreate(MeetingBase):
-    # user_id is derived from the API token, not sent in request
+class MeetingCreate(BaseModel):
+    platform: Platform
+    native_meeting_id: str = Field(..., description="The platform-specific ID for the meeting (e.g., Google Meet code, Zoom ID)")
     bot_name: Optional[str] = Field(None, description="Optional name for the bot in the meeting")
+    language: Optional[str] = Field(None, description="Optional language code for transcription (e.g., 'en', 'es')")
+    task: Optional[str] = Field(None, description="Optional task for the transcription model (e.g., 'transcribe', 'translate')")
+
+    @validator('platform')
+    def platform_must_be_valid(cls, v):
+        """Validate that the platform is one of the supported platforms"""
+        try:
+            Platform(v)
+            return v
+        except ValueError:
+            supported = ', '.join([p.value for p in Platform])
+            raise ValueError(f"Invalid platform '{v}'. Must be one of: {supported}")
 
 class MeetingResponse(BaseModel): # Not inheriting from MeetingBase anymore to avoid duplicate fields if DB model is used directly
     id: int = Field(..., description="Internal database ID for the meeting")

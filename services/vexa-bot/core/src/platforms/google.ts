@@ -123,14 +123,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
   // Add type assertion for the object passed to evaluate
   await page.evaluate(async (config: BotConfig) => {
     // Destructure inside evaluate with types if needed, or just use config.* directly
-    const { meetingUrl, token, connectionId, platform, nativeMeetingId } = config;
-
-    const option = {
-      language: null,
-      task: "transcribe",
-      modelSize: "medium",
-      useVad: true,
-    }
+    const { meetingUrl, token, connectionId, platform, nativeMeetingId, language: initialLanguage, task: initialTask } = config;
 
     await new Promise<void>((resolve, reject) => {
       try {
@@ -183,7 +176,6 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
         
         let socket: WebSocket | null = null;
         let isServerReady = false;
-        let language = option.language;
         let retryCount = 0;
         const maxRetries = 5;
         const retryDelay = 2000;
@@ -206,25 +198,23 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               retryCount = 0;
 
               if (socket) {
-                // Construct the handshake message DIRECTLY here
-                // Ensure platform, token, nativeMeetingId, meetingUrl are correctly passed
-                // into the page.evaluate scope from the outer botConfig
-                const handshakePayload = {
-                    uid: sessionUid,       // <-- USE sessionUid directly
-                    language: null,          // *** CHANGED from "ru" to null ***
-                    task: "transcribe",     // Literal value - Ensure this is required
-                    model: "medium",       // Literal value or from config if needed
-                    use_vad: true,           // Literal value or from config if needed
-                    platform: platform,      // External platform name passed into evaluate
-                    token: token,            // User token passed into evaluate
-                    meeting_id: nativeMeetingId, // Native ID passed into evaluate
-                    meeting_url: meetingUrl  // Meeting URL passed into evaluate
+                // Construct the initial configuration message using config values
+                const initialConfigPayload = {
+                    uid: sessionUid,            // Use connectionId
+                    language: initialLanguage || null, // Use language from config, default to null
+                    task: initialTask || 'transcribe', // Use task from config, default to 'transcribe'
+                    model: "medium",            // Keep default or make configurable if needed
+                    use_vad: true,            // Keep default or make configurable if needed
+                    platform: platform,           // From config
+                    token: token,               // From config
+                    meeting_id: nativeMeetingId,  // From config
+                    meeting_url: meetingUrl || null // From config, default to null
                 };
 
-                const jsonPayload = JSON.stringify(handshakePayload);
+                const jsonPayload = JSON.stringify(initialConfigPayload);
 
                 // Log the exact payload being sent
-                (window as any).logBot(`DEBUG: Sending Handshake Payload: ${jsonPayload}`);
+                (window as any).logBot(`Sending initial config message: ${jsonPayload}`);
                 socket.send(jsonPayload);
               }
             };
@@ -240,7 +230,7 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
               } else if (!isServerReady) {
                  isServerReady = true;
                  (window as any).logBot("Server is ready.");
-              } else if (language === null && data["language"]) {
+              } else if (data["language"]) {
                 (window as any).logBot(`Language detected: ${data["language"]}`);
               } else if (data["message"] === "DISCONNECT") {
                 (window as any).logBot("Server requested disconnect.");
