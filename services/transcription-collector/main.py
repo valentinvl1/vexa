@@ -14,7 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 from typing import Optional, List, Dict, Any, Set, Tuple
 from pydantic import ValidationError
-import pandas as pd
 
 from shared_models.database import get_db, init_db, async_session_local
 from shared_models.models import APIToken, User, Meeting, Transcription, MeetingSession

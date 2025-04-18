@@ -144,18 +144,20 @@ class VexaClient:
             payload["bot_name"] = bot_name
         return self._request("POST", "/bots", api_type='user', json_data=payload)
 
-    def stop_bot(self, platform: str, native_meeting_id: str) -> Dict[str, Any]:
+    def stop_bot(self, platform: str, native_meeting_id: str) -> Dict[str, str]:
         """
-        Stops a running bot for a specific meeting using platform and native ID.
+        Requests a running bot to stop for a specific meeting using platform and native ID.
+        The API returns a 202 Accepted response immediately while the stop happens in the background.
 
         Args:
             platform: Platform identifier (e.g., 'google_meet', 'zoom').
             native_meeting_id: The platform-specific meeting identifier.
 
         Returns:
-            Dictionary representing the updated Meeting object.
+            A dictionary containing a confirmation message (e.g., {"message": "..."}).
         """
         path = f"/bots/{platform}/{native_meeting_id}"
+        # _request handles 202 status and returns the JSON body
         return self._request("DELETE", path, api_type='user')
 
     # --- Transcriptions ---

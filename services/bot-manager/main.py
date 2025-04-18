@@ -16,7 +16,7 @@ import asyncio # <--- Import asyncio
 
 from config import BOT_IMAGE_NAME, REDIS_URL
 from docker_utils import get_socket_session, close_docker_client, start_bot_container, stop_bot_container, _record_session_start
-from shared_models.database import init_db, get_db
+from shared_models.database import init_db, get_db, async_session_local
 from shared_models.models import User, Meeting # Import Meeting model
 from shared_models.schemas import MeetingCreate, MeetingResponse, Platform # Import new schemas and Platform
 from auth import get_user_and_token # Import the new dependency
@@ -208,82 +208,155 @@ async def request_bot(
             detail={"status": "error", "message": f"An unexpected error occurred during bot startup: {str(e)}", "meeting_id": meeting_id}
         )
 
+# --- Background Task for Stopping Container ---
+async def _handle_container_stop(meeting_id: int, container_id: str):
+    """
+    Background task to update status to stopping, stop the Docker container,
+    and update the final meeting status.
+    """
+    current_status = 'stopping' # Initial status for this task
+    # Update DB to 'stopping' first using a new session
+    async with async_session_local() as db:
+        try:
+            stmt = select(Meeting).where(Meeting.id == meeting_id)
+            result = await db.execute(stmt)
+            meeting = result.scalars().first()
+            if meeting and meeting.status == 'active': # Only proceed if it was active
+                meeting.status = current_status
+                meeting.end_time = datetime.utcnow() # Mark when stop process started
+                await db.commit()
+                logger.info(f"[Background Task] Updated meeting {meeting_id} status to '{current_status}'. Proceeding to stop container.")
+            elif not meeting:
+                 logger.error(f"[Background Task] Could not find meeting {meeting_id} to initiate stop.")
+                 return # Exit task if meeting not found
+            else: # Meeting exists but wasn't active (e.g., requested, already stopping/stopped)
+                 logger.warning(f"[Background Task] Meeting {meeting_id} status was '{meeting.status}'. Stop initiation skipped.")
+                 return # Exit task if meeting wasn't in active state
+        except Exception as e:
+            logger.error(f"[Background Task] DB error setting status to '{current_status}' for meeting {meeting_id}: {e}", exc_info=True)
+            return # Exit task if initial DB update fails
+    
+    # Now attempt to stop the container
+    logger.info(f"[Background Task] Attempting to stop container {container_id} for meeting {meeting_id}")
+    # Consider running synchronous blocking call in a thread pool executor
+    # For now, call directly (might block event loop if long)
+    stopped = stop_bot_container(container_id) 
+
+    final_status = 'error' # Default to error
+    if stopped:
+        logger.info(f"[Background Task] Successfully stopped/confirmed stopped container {container_id} for meeting {meeting_id}")
+        final_status = 'stopped'
+    else:
+        logger.error(f"[Background Task] Stop command failed or container {container_id} not found by Docker for meeting {meeting_id}. Marking as error.")
+
+    # Update DB with final status using a new session
+    async with async_session_local() as db:
+        try:
+            # Fetch the record again to perform the final update
+            stmt = select(Meeting).where(Meeting.id == meeting_id)
+            result = await db.execute(stmt)
+            meeting = result.scalars().first()
+            if meeting:
+                # Only update if it's still in 'stopping' state (or maybe active if first update failed?)
+                # Let's update regardless of previous state, as this is the final outcome
+                meeting.status = final_status
+                await db.commit()
+                logger.info(f"[Background Task] Updated meeting {meeting_id} final status to '{final_status}'")
+            else:
+                logger.error(f"[Background Task] Could not find meeting {meeting_id} to update final status.")
+        except Exception as e:
+            logger.error(f"[Background Task] DB error updating final status for meeting {meeting_id}: {e}", exc_info=True)
+
+
 @app.delete("/bots/{platform}/{native_meeting_id}",
-             status_code=status.HTTP_200_OK,
-             response_model=MeetingResponse,
-             summary="Stop a running bot for a specific meeting using platform and native ID",
+             # Change status code to 202 Accepted if we want to strictly follow async pattern
+             status_code=status.HTTP_202_ACCEPTED, 
+             # status_code=status.HTTP_200_OK, # Keep 200 OK for now
+             # response_model=MeetingResponse, # Return minimal response now
+             summary="Request stop for a running bot",
+             description="Requests the bot associated with the platform and native meeting ID to stop. Returns 202 Accepted immediately while stop happens in background.",
              dependencies=[Depends(get_user_and_token)])
 async def stop_bot(
     platform: Platform,
     native_meeting_id: str,
+    background_tasks: BackgroundTasks, # <--- Inject BackgroundTasks
     auth_data: tuple[str, User] = Depends(get_user_and_token),
     db: AsyncSession = Depends(get_db)
 ):
-    """Stops the bot container associated with the platform and native meeting ID, verifying ownership."""
+    """Requests the stop of the bot container associated with the platform and native meeting ID.
+    Verifies ownership. Schedules background task for actual stop and DB updates.
+    Returns 202 Accepted immediately.
+    """
     # Unpack the token and user from the dependency result
     user_token, current_user = auth_data
 
     logger.info(f"User {current_user.id} requested to stop bot for platform '{platform.value}' with native ID: '{native_meeting_id}'")
 
-    # 1. Find the *latest* active or requested meeting matching criteria for the user
-    # (Handling potential past meetings with the same ID)
+    # 1. Find the *latest* meeting in a potentially stoppable state ('requested', 'active')
+    # Let the background task handle idempotency for 'stopping' state
     stmt = select(Meeting).where(
         Meeting.user_id == current_user.id,
         Meeting.platform == platform.value,
         Meeting.platform_specific_id == native_meeting_id,
-        Meeting.status.in_(['requested', 'active'])
+        Meeting.status.in_(['requested', 'active']) 
     ).order_by(Meeting.created_at.desc())
 
     result = await db.execute(stmt)
     meeting = result.scalars().first()
 
+    # Prepare response content (will be returned if meeting found or not)
+    response_content = {"message": "Stop request accepted and is being processed."} 
+
     if not meeting:
-        # Check if a meeting exists but is already stopped/error
-        stmt_inactive = select(Meeting).where(
+        # Check if a meeting exists but is already in a final state ('stopping', 'stopped', 'error')
+        stmt_final = select(Meeting).where(
             Meeting.user_id == current_user.id,
             Meeting.platform == platform.value,
-            Meeting.platform_specific_id == native_meeting_id
-        ).order_by(Meeting.created_at.desc())
-        result_inactive = await db.execute(stmt_inactive)
-        inactive_meeting = result_inactive.scalars().first()
-        if inactive_meeting:
-            logger.warning(f"Attempt to stop meeting for {platform.value}/{native_meeting_id} which is already in status '{inactive_meeting.status}' (Meeting ID: {inactive_meeting.id})")
-            return MeetingResponse.from_orm(inactive_meeting) # Return current state
+            Meeting.platform_specific_id == native_meeting_id,
+            # Meeting.status.in_(['stopping', 'stopped', 'error']) # Check final/pending states
+        ).order_by(Meeting.created_at.desc()).limit(1)
+        result_final = await db.execute(stmt_final)
+        final_meeting = result_final.scalars().first()
+        
+        if final_meeting:
+            logger.warning(f"Attempt to stop meeting for {platform.value}/{native_meeting_id} which is already in status '{final_meeting.status}' (Meeting ID: {final_meeting.id}). Accepting request anyway for idempotency.")
+            # Still return 202 Accepted, the state won't change
+            return response_content
         else:
-            logger.warning(f"No active or inactive meeting found for user {current_user.id}, platform '{platform.value}', native ID '{native_meeting_id}'")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No active meeting found for platform {platform.value} and meeting ID {native_meeting_id}.")
+            logger.warning(f"No meeting found for user {current_user.id}, platform '{platform.value}', native ID '{native_meeting_id}' to stop.")
+            # Return 404 if no meeting record exists at all
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No meeting found for platform {platform.value} and meeting ID {native_meeting_id}.")
 
-    # Found an active/requested meeting - meeting.id is the internal ID
+    # Found a meeting in 'requested' or 'active' state - meeting.id is the internal ID
     internal_meeting_id = meeting.id
-    logger.info(f"Found active meeting {internal_meeting_id} matching {platform.value}/{native_meeting_id} for user {current_user.id}")
+    logger.info(f"Found meeting {internal_meeting_id} (status: {meeting.status}) matching {platform.value}/{native_meeting_id} for user {current_user.id}")
 
-    # Ownership is implicitly verified by the initial query including user_id
-
-    # 2. Attempt to stop the container
+    # 2. Handle based on current state ('requested' or 'active')
     container_id = meeting.bot_container_id
-    stop_success = False
-    if container_id:
-        logger.info(f"Attempting to stop container {container_id} for meeting {internal_meeting_id}")
-        stopped = stop_bot_container(container_id)
-        if stopped:
-            logger.info(f"Successfully sent stop command to container {container_id}")
-            stop_success = True
+    
+    if meeting.status == 'active':
+        if container_id:
+            logger.info(f"Scheduling background stop for container {container_id} for meeting {internal_meeting_id}")
+            # Schedule the DB updates and actual stop
+            background_tasks.add_task(_handle_container_stop, internal_meeting_id, container_id)
         else:
-            logger.error(f"Stop command failed or container {container_id} not found by Docker for meeting {internal_meeting_id}. Marking as error.")
-            meeting.status = 'error' # Mark as error if stop failed
-    else:
-        # This case might happen if status was 'requested' but no container was ever assigned
-        logger.warning(f"No container ID found for meeting {internal_meeting_id} with status '{meeting.status}'. Marking as stopped.")
-        stop_success = True # No container to stop, consider it 'stopped'
+             # Should not happen for 'active' status, but handle defensively
+             logger.error(f"Meeting {internal_meeting_id} is active but has no container ID. Cannot schedule stop.")
+             # Fall through to return 202, but log error. Background task won't run.
 
-    # 3. Update Meeting record
-    if stop_success:
-        meeting.status = 'stopped'
-    meeting.end_time = datetime.utcnow()
-    await db.commit()
-    await db.refresh(meeting)
+    elif meeting.status == 'requested':
+        # No container assigned yet. Update status directly to 'stopped' in background?
+        # For now, let's just accept the request. If a container gets created later,
+        # the stop logic might need refinement. Or maybe update to 'stopped' here.
+        # Let's schedule the background task anyway, it will handle the 'requested' state check.
+        logger.info(f"Meeting {internal_meeting_id} is in 'requested' state. Scheduling stop handler (will likely just update DB). Container ID: {container_id}")
+        background_tasks.add_task(_handle_container_stop, internal_meeting_id, container_id if container_id else "N/A") # Pass placeholder if no ID
+        
+    # --- Return 202 Accepted immediately --- 
+    # Avoid committing/refreshing in the main handler
+    logger.info(f"Stop request for meeting {internal_meeting_id} accepted. Processing in background.")
+    return response_content
 
-    return MeetingResponse.from_orm(meeting)
 
 # Remove old/debug endpoints if they exist
 
