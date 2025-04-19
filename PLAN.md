@@ -1,95 +1,196 @@
-Okay, assuming you have successfully stashed the recent changes and reverted the `bot-manager` and `vexa-bot` codebases to a stable version where bots start reliably (even if they don't leave gracefully or support runtime config), here is the revised, chunked implementation plan using Redis Pub/Sub.
+# Vexa Billing, Rate Limiting, and Analytics Implementation Plan
 
-**Overall Objectives:**
+This document outlines a detailed plan for integrating billing, rate limiting, and analytics features into the Vexa system, building upon the existing architecture described in `system-design.md` and `docker-compose.yml`.
 
-1.  **Initial Configuration:** Set transcription `language` and `task` on bot creation.
-2.  **Runtime Reconfiguration:** Change `language`/`task` for active bots.
-3.  **Graceful Leave:** Have bots attempt to leave the meeting cleanly before container termination.
+**Assumptions:**
 
-**Chosen Architecture:** Redis Pub/Sub for runtime commands (`reconfigure`, `leave`).
+*   Access to modify codebases: `api-gateway`, `admin-api`, `bot-manager`, `transcription-collector`, `vexa-bot`, `whisperlive`.
+*   Existence of a `shared_models` package/directory for common PostgreSQL models/schemas.
+*   Introduction of a new `billing-service`.
+*   Primary billing metric: **Transcription minutes consumed, differentiated by model type**.
+*   Rate limits apply to: **API request frequency** and **concurrent bot sessions**.
 
-**Prerequisites & Notes:**
-*   **`whisperlive` Confirmation:** Research confirms `whisperlive` accepts `language`/`task`/`uid`/etc. via an initial JSON message sent over the WebSocket upon connection. No changes are needed in `whisperlive` for Phase 1.
-*   **`bot-manager` Redis Client:** The `aioredis` client needed for publishing commands in Phase 3/4 must be initialized (e.g., during startup) in `services/bot-manager/main.py`, as the existing general Redis init is commented out. **[DONE in Phase 3]**
-*   **Unique ID:** The `connectionId` generated in `docker_utils.py` and passed via `BOT_CONFIG` to `vexa-bot` will be used for the Pub/Sub channel (`bot_commands:{connectionId}`).
-*   **`vexa-bot` Network:** The current `DOCKER_NETWORK=vexa_vexa_default` setting is confirmed to be working. No change is needed.
+**Phase 1: Foundations - Database Models & Billing Service Shell**
 
----
+1.  **Define Database Schemas (`shared_models/models.py` or similar):**
+    *   **`Plan` Table:**
+        *   `id` (PK, UUID/Serial)
+        *   `name` (String, unique, e.g., "Free", "Pro", "Enterprise")
+        *   `description` (Text, optional)
+        *   `api_requests_per_minute` (Integer, nullable) - Rate limit for API gateway
+        *   `max_concurrent_bots` (Integer, nullable) - Rate limit for bot manager
+        *   `monthly_cost` (Numeric/Decimal, optional)
+        *   `is_active` (Boolean, default: True)
+        *   `created_at`, `updated_at` (Timestamps)
+    *   **`PlanModelLimit` Table:** (Billing limits per model)
+        *   `id` (PK)
+        *   `plan_id` (FK -> `Plan.id`)
+        *   `model_identifier` (String, e.g., "faster-whisper-medium", "whisper-large-v3") - Must match identifier used by `whisperlive`.
+        *   `included_minutes` (Integer, nullable) - Billing quota
+        *   `price_per_extra_minute` (Numeric/Decimal, nullable) - Overage cost
+        *   `created_at`, `updated_at`
+    *   **`UserPlan` Table:** (Assigns plans to users)
+        *   `id` (PK)
+        *   `user_id` (FK -> `User.id`) - Assumes `User` table in `admin-api`/`shared_models`.
+        *   `plan_id` (FK -> `Plan.id`)
+        *   `billing_cycle_anchor` (Timestamp) - Day/time billing resets each cycle.
+        *   `start_date` (Timestamp)
+        *   `end_date` (Timestamp, nullable)
+        *   `status` (String, e.g., "active", "cancelled", "trial")
+        *   `created_at`, `updated_at`
+    *   **`UsageRecord` Table:** (Aggregated usage per billing cycle)
+        *   `id` (PK)
+        *   `user_plan_id` (FK -> `UserPlan.id`)
+        *   `model_identifier` (String)
+        *   `billing_period_start` (Timestamp)
+        *   `billing_period_end` (Timestamp)
+        *   `consumed_minutes` (Numeric/Decimal, default: 0) - Use decimal for precision.
+        *   `last_updated` (Timestamp)
 
-**Phase 1: Initial Configuration (`language`/`task` on Start) - ✅ COMPLETE & VERIFIED**
+2.  **Update `shared_models/schemas.py`:**
+    *   Create Pydantic schemas corresponding to the new DB tables for API validation and responses.
 
-*   **Goal:** Allow passing optional `language` and `task` during bot creation (`POST /bots`) and have `vexa-bot` use these when establishing the initial WebSocket connection to `whisperlive`.
-*   **Steps:**
-    1.  **(Schema):** Modify `libs/shared-models/shared_models/schemas.py`: Add `language: Optional[str] = None`, `task: Optional[str] = None` to the `MeetingCreate` Pydantic model.
-    2.  **(Bot Manager API):** Modify `services/bot-manager/main.py` -> `request_bot` function: Ensure it correctly passes the received `req.language` and `req.task` values down to the `start_bot_container` function call.
-    3.  **(Bot Manager Docker):** Modify `services/bot-manager/docker_utils.py` -> `start_bot_container` function:
-        *   Accept optional `language` and `task` parameters.
-        *   Add `language`, `task` (if provided, else `None`), and the `redis_url` (e.g., `os.getenv("REDIS_URL", "redis://redis:6379/0")`) to the `bot_config_data` dictionary. Ensure `None` values are handled correctly during JSON serialization (they should ideally be included as `null` or omitted if `whisperlive` / `vexa-bot` prefers). Clean the dict of `None` values before `json.dumps`.
-    4.  **(Vexa Bot Config Schema):** Modify `services/vexa-bot/core/src/docker.ts` (or wherever `BotConfigSchema` is defined): Add `language: z.string().nullish()`, `task: z.string().nullish()`, and `redisUrl: z.string()` to the Zod schema.
-    5.  **(Vexa Bot Type):** Modify `services/vexa-bot/core/src/types.ts` -> `BotConfig` type: Add `language?: string | null`, `task?: string | null`, and `redisUrl: string`.
-    6.  **(Vexa Bot Config Usage):** Modify `services/vexa-bot/core/src/index.ts` (or the main entry point):
-        *   Parse `language`, `task`, `redisUrl`, and `connectionId` from the validated `botConfig`.
-        *   Store `language`, `task`, and `connectionId` in module-level variables so the WebSocket logic and Redis listener can access the *current* desired values.
-    7.  **(Vexa Bot WebSocket):** Modify the WebSocket connection logic (likely in `services/vexa-bot/core/src/platforms/google.ts` -> `setupWebSocket` or the `evaluate` block within `startRecording`):
-        *   When sending the *initial* config message (the first message after WS connection), retrieve the stored `language`, `task`, `connectionId`, `platform`, `meetingUrl`, `token`, `nativeMeetingId` etc. from the module-level variables derived from `BOT_CONFIG`.
-        *   Construct the JSON payload including these fields (`uid` should be `connectionId`). Send `null` for optional fields if they are `null`/`undefined`.
-*   **Testing (After Rebuilding `bot-manager` & `vexa-bot`):**
-    *   `Test 1.1:` Call `POST /bots` *without* language/task. Check `vexa-bot` logs: verify the initial WS config message sends `language: null` (or similar default) and `task: null` (or default like 'transcribe'), along with `uid` (matching `connectionId`), `platform`, `meetingUrl`, `token`, `meeting_id` (matching nativeMeetingId). Note the `connectionId`.
-    *   `Test 1.2:` Stop the previous bot (`DELETE /bots/...`).
-    *   `Test 1.3:` Call `POST /bots` *with* `language: "es"` and `task: "translate"`. Check `vexa-bot` logs: verify the initial WS config message sends `language: "es"` and `task: "translate"`. Note the `connectionId`.
-    *   `Test 1.4:` Stop the second bot (`DELETE /bots/...`).
+3.  **Create `billing-service`:**
+    *   **Project Setup:** `services/billing-service` directory with standard FastAPI structure (`main.py`, `crud.py`, `database.py`, `models.py` [imports `shared_models`], `schemas.py` [imports/extends `shared_models`]).
+    *   **Dockerfile:** Create `services/billing-service/Dockerfile`.
+    *   **`docker-compose.yml`:**
+        *   Add `billing-service` definition.
+        *   Set build context/Dockerfile.
+        *   Define dependencies: `postgres` (condition: service_healthy), `redis` (condition: service_started).
+        *   Map environment variables (DB connection string, Redis URL).
+        *   Assign to `vexa_default` network.
+        *   Expose internal port (e.g., 8002).
+        *   Implement a basic health check endpoint and configure it in `docker-compose`.
 
-**Phase 2: `vexa-bot` Redis Client & Command Listener Setup - ✅ COMPLETE**
+**Phase 2: Metric Collection - Tracking Model & Duration**
 
-*   **Goal:** Enable `vexa-bot` to connect to Redis and listen for commands on its unique channel.
-*   **Status:** This was implemented as part of Phase 3.
-*   **Steps:**
-    1.  **(Vexa Bot Dependency):** Added `redis` to `package.json`. **[DONE]**
-    2.  **(Vexa Bot Redis Logic):** Modified `services/vexa-bot/core/src/index.ts`: **[DONE]**
-        *   Imported `redis` library.
-        *   Created Redis client instance (`subscriber`).
-        *   Defined subscription channel `bot_commands:{currentConnectionId}`.
-        *   Defined `handleRedisMessage` function (initially just logging, now expanded in Phase 3).
-        *   Subscribed to channel using `subscriber.subscribe`.
-*   **Testing:** Initial connection/subscription verified. Full command handling tested in Phase 3.
+1.  **Allow Model Selection (`api-gateway`, `bot-manager`, `vexa-bot`):**
+    *   **`api-gateway` (`services/api-gateway/app/main.py` - Forwarding Logic):**
+        *   Modify `POST /bots` endpoint: Expect optional `model_type` (String) in the request body.
+        *   Pass `model_type` along in the forwarded request payload to `bot-manager`.
+    *   **`bot-manager` (`services/bot-manager/app/main.py` - `POST /bots` Handler):**
+        *   Accept `model_type` from the request body.
+        *   *Enhancement:* Validate `model_type` against `PlanModelLimit` entries for the user's plan (requires call to `billing-service` or DB).
+        *   Add `model_type` to the `BOT_CONFIG` JSON string passed as an environment variable to the `vexa-bot` container.
+    *   **`vexa-bot` (`services/vexa-bot/core/src/config.ts`, `main.ts`, `google.ts`):**
+        *   Parse `BOT_CONFIG` JSON to extract `model_type`.
+        *   Include the requested `model_type` in the initial JSON configuration message sent over the WebSocket to `whisperlive`.
 
-**Phase 3: Implement Runtime Reconfiguration (Language/Task via Redis) - ✅ COMPLETE & VERIFIED**
+2.  **Report Model Used & Emit Usage (`whisperlive`, `transcription-collector`):**
+    *   **`whisperlive` (`services/WhisperLive/` - WebSocket Handler):**
+        *   Receive `model_type` from the initial client configuration message.
+        *   Determine the `actual_model_identifier` being used for transcription (e.g., could be a default if requested model is invalid/unavailable).
+        *   **Crucial:** Include this `actual_model_identifier` in **both** the `session_start` event and **every** `transcription` event published to the `transcription_segments` Redis Stream. Add a new field like `"model_identifier": "..."`.
+    *   **`transcription-collector` (`services/transcription-collector/app/` - Stream Consumer):**
+        *   **Caching Model Info:** When processing `session_start` events, cache the `actual_model_identifier` associated with the `uid` (e.g., in a Redis Hash `session_model:{uid}` with a TTL).
+        *   **Processing Transcriptions:** When processing `transcription` events:
+            *   Retrieve `actual_model_identifier` for the event's `uid` from the cache.
+            *   Calculate the duration of the *new* segment (`end_time - start_time`). Ensure idempotency if streams deliver duplicates.
+            *   Look up `user_id` and `meeting_id` (likely using `uid`).
+            *   Publish a new event type, `usage_update`, to a **new Redis Stream** (e.g., `name: usage_events`).
+            *   `usage_update` event payload (JSON): `{ "user_id": ..., "meeting_id": ..., "model_identifier": ..., "duration_seconds_added": ..., "timestamp": ... }`.
 
-*   **Goal:** Change `language`/`task` via `PUT /bots/.../config`, triggering a WebSocket reconnect in the bot using the new parameters.
-*   **Session Handling Clarification:** To send the `reconfigure` command to the correct *running* bot instance, `bot-manager` **must** identify the *earliest* `session_uid` (the original `connectionId`) associated with the active meeting (from the `MeetingSession` table). It uses this `session_uid` to publish the command to the correct Redis channel (`bot_commands:{original_session_uid}`). The running `vexa-bot` instance receives this command, signals its browser context, closes the existing WebSocket connection, and then initiates a **new WebSocket connection** (by re-running its `setupWebSocket` logic which executes `new WebSocket(...)`) to WhisperLive using the updated configuration parameters (`language`, `task`). Crucially, for this new connection, `vexa-bot` **generates a new, unique session identifier (`uid`)** to distinguish this reconfigured session. This new `uid` is sent in the initial WebSocket message. Downstream processing (e.g., by `transcription-collector` processing the `session_start` event from `whisperlive`) **results in a new `MeetingSession` record** being created in the database for this new `uid`.
-*   **Steps:**
-    1.  **(Bot Manager: Redis Client Init):** Modified `services/bot-manager/main.py`: Initialized `aioredis` client in `startup_event`, added global variable, added closing logic in `shutdown_event`. **[DONE]**
-    2.  **(Bot Manager: API Endpoint):** Modified `services/bot-manager/main.py`: Added `MeetingConfigUpdate` Pydantic model, added `PUT /bots/{platform}/{native_meeting_id}/config` endpoint, implemented logic to find the *most recent* active meeting and its *earliest* session UID, construct payload, and publish via Redis client. **[DONE]**
-    3.  **(API Gateway: Routing):** Modified `services/api-gateway/main.py`: Added route definition for `PUT /bots/{platform}/{native_meeting_id}/config` to forward requests to `bot-manager`. **[DONE]**
-    4.  **(Vexa Bot: Browser Reconfig):** Modified `services/vexa-bot/core/src/platforms/google.ts` (inside `page.evaluate`): Added browser-scope state variables (`currentWsLanguage`, `currentWsTask`), added UUID generation, modified WS `onopen` payload to use the new UUID and current language/task, exposed `window.triggerWebSocketReconfigure` function to update browser state and close socket. **[DONE]**
-    5.  **(Vexa Bot: Node Handler):** Modified `services/vexa-bot/core/src/index.ts`: Made `handleRedisMessage` async, added `page` parameter, implemented `reconfigure` action handling to update Node state and call `page.evaluate` to trigger the browser function. Updated `redisSubscriber.subscribe` call to pass `page` and added debug logging. **[DONE]**
-    6.  **(Vexa Bot: Build Fix):** Resolved `docker build` context issue for `entrypoint.sh`. **[DONE]**
-*   **Testing:**
-    *   Verified `bot-manager` publishes `reconfigure` command to the correct Redis channel (`bot_commands:{original_connectionId}`).
-    *   Verified `vexa-bot` receives command via Redis and logs receipt.
-    *   Verified `vexa-bot` calls browser function, closes WebSocket, and reconnects using new parameters (language/task).
-    *   Verified each WebSocket reconnection generates and uses a **new unique session ID (UUID)** in the initial config message.
-    *   Verified `transcription-collector` processes the `session_start` event for each new connection UID.
-    *   Verified a **new `MeetingSession` row** is created in the database for each unique session UID associated with the meeting.
-    *   Verified multiple sequential reconfigurations work correctly.
+**Phase 3: Enforcement - Limits & Quotas**
 
-**Phase 4: Implement Graceful Leave via Redis & Delayed Stop - ✅ COMPLETE (Graceful path tested)**
+1.  **API Rate Limiting (`api-gateway`):**
+    *   **Dependency:** Add `slowapi` to `services/api-gateway/requirements.txt`.
+    *   **Implementation (`services/api-gateway/app/main.py`):**
+        *   Initialize `slowapi.Limiter` with `RedisStorage` using `REDIS_URL`.
+        *   Create a reusable dependency function (`get_current_user_and_plan_limits`) that:
+            *   Extracts `X-API-Key` header.
+            *   Authenticates key -> `user_id` (call `admin-api` or direct DB, use caching).
+            *   Fetches user's active `UserPlan` -> `plan_id` (call `billing-service` or direct DB, use caching).
+            *   Fetches `Plan` details for `plan_id` -> `api_requests_per_minute` limit (use caching).
+            *   Returns `(user_id, api_limit_string)` (e.g., `(123, "100/minute")`).
+        *   Apply the limiter using FastAPI middleware or route decorators (`@limiter.limit(get_current_user_and_plan_limits)`), dynamically setting the limit per user based on their plan. Key the limit by `user_id`.
 
-*   **Goal:** Trigger graceful leave in `vexa-bot` via Redis before `bot-manager` forcefully stops the container.
-*   **Status:** Implemented. Graceful leave path confirmed working. Delayed stop fallback mechanism was implemented but *not explicitly tested* by the user.
-*   **Steps:**
-    1.  **(Vexa Bot Leave Function):** Implemented `leaveGoogleMeet()` in `google.ts` and `performGracefulLeave()` in `index.ts`. **[DONE]**
-    2.  **(Vexa Bot Leave Handler):** Modified Redis `handleRedisMessage` in `index.ts` to call `performGracefulLeave`. **[DONE]**
-    3.  **(Bot Manager Delayed Stop Task):** Created `_delayed_container_stop` async task in `main.py` using `asyncio.to_thread`. **[DONE]**
-    4.  **(Bot Manager Delete API):** Modified `DELETE /bots/...` endpoint in `main.py` to find session UID, publish `leave` command, schedule delayed stop, update status to `stopping`, return `202 Accepted`. **[DONE]**
-*   **Testing:**
-    *   `Test 4.1-4.3:` (Happy Path) Verified leave command sent, bot attempts leave, exits cleanly, container stops quickly. **[DONE]**
-    *   `Test 4.4:` (Fallback Test) Skipped by user.
+2.  **Concurrent Bot Limit (`bot-manager`):**
+    *   **Implementation (`services/bot-manager/app/main.py` - `POST /bots` Handler):**
+        *   After authenticating `X-API-Key` -> `user_id`:
+            *   Fetch the user's active plan and `max_concurrent_bots` limit (call `billing-service` or DB, use caching).
+            *   Perform a DB query: `SELECT COUNT(*) FROM meetings WHERE user_id = :user_id AND status = 'active'`.
+            *   If `count >= max_concurrent_bots`, return HTTP `429 Too Many Requests` or `403 Forbidden`.
 
-**Phase 5: (Optional but Recommended) Add Signal Handling Back - ⏭️ SKIPPED**
+3.  **Transcription Quota Check (`bot-manager`, `billing-service`):**
+    *   **`billing-service` API Endpoint:**
+        *   Create `GET /internal/usage/check_quota` (or similar internal path).
+        *   Query Parameters: `user_id`, `model_identifier`.
+        *   Logic:
+            *   Find active `UserPlan` for `user_id`. If none, deny.
+            *   Determine current billing cycle start/end based on `UserPlan.billing_cycle_anchor`.
+            *   Fetch `PlanModelLimit.included_minutes` for the plan and `model_identifier`. If no limit defined, allow.
+            *   Fetch `UsageRecord.consumed_minutes` for the user, model, and current cycle.
+            *   Calculate `remaining_minutes = included_minutes - consumed_minutes`.
+            *   Return JSON: `{"quota_available": (remaining_minutes > 0), "remaining_minutes": remaining_minutes}`.
+    *   **`bot-manager` (`services/bot-manager/app/main.py` - `POST /bots` Handler):**
+        *   **Before** starting the Docker container:
+            *   Make an HTTP request to the `billing-service`'s `/internal/usage/check_quota` endpoint with `user_id` and requested `model_type`.
+            *   If the response indicates `quota_available` is `False`, return HTTP `402 Payment Required` or `403 Forbidden`.
 
-*   **Goal:** Make `SIGTERM`/`SIGINT` also trigger the graceful leave as a fallback.
-*   **Status:** Skipped by user request.
-*   **Steps:** *(Not Implemented)*
+**Phase 4: Aggregation & Presentation**
 
-This chunked plan allows for incremental development and testing of each functional piece. Remember to rebuild the necessary images (`api-gateway`, `bot-manager`, `vexa-bot`) after applying the code changes for each phase.
+1.  **Usage Aggregation (`billing-service`):**
+    *   **Consumer:** Implement a background task (e.g., using `arq`, `Celery`, or simple `asyncio` loop) or a dedicated stream consumer process within `billing-service` listening to the `usage_events` Redis Stream.
+    *   **Logic:** For each `usage_update` event:
+        *   Find the user's active `UserPlan`.
+        *   Determine the correct billing period based on the event's timestamp and `UserPlan.billing_cycle_anchor`.
+        *   Find or create the `UsageRecord` for the `user_plan_id`, `model_identifier`, and `billing_period_start`/`end`.
+        *   Atomically update `UsageRecord.consumed_minutes` by adding `duration_seconds_added / 60.0`. Use database atomic operations (e.g., `UPDATE usage_records SET consumed_minutes = consumed_minutes + :added WHERE id = :id`) to prevent race conditions. Update `last_updated`.
+
+2.  **Plan/Subscription Management (`admin-api`):**
+    *   **Endpoints (`services/admin-api/app/routers/admin_billing.py` or similar):**
+        *   Add CRUD endpoints protected by `X-Admin-API-Key` authentication:
+            *   `/admin/plans` (POST, GET)
+            *   `/admin/plans/{plan_id}` (GET, PUT, DELETE) - Handle nested `PlanModelLimit` updates.
+            *   `/admin/users/{user_id}/plan` (POST, GET, PUT, DELETE) - Manage `UserPlan` assignments.
+    *   **CRUD Functions:** Implement corresponding database operations using SQLAlchemy/shared models.
+
+3.  **Billing/Usage View (Optional - Future):**
+    *   **`billing-service` API:** Add user-facing endpoints like `GET /billing/me/plan`, `GET /billing/me/usage`.
+    *   **`api-gateway`:** Expose these endpoints, forwarding requests authenticated with `X-API-Key` to `billing-service`.
+
+**Phase 5: Analytics**
+
+1.  **Strategy Selection:** Choose between:
+    *   **Log-based (Simpler Start):** Structured JSON logging from services -> Log Collector (Filebeat/Fluentd) -> Storage/Visualizer (Elasticsearch/Loki + Kibana/Grafana).
+    *   **Event-based (More Robust):** Services publish detailed events to dedicated stream (Redis Streams/Kafka) -> Analytics Processor Service -> Analytics DB (TimescaleDB/ClickHouse) -> Visualizer (Grafana).
+    *   *Decision:* Assume Log-based for initial implementation.
+
+2.  **Structured Logging:**
+    *   **Libraries:** Use `python-json-logger` or similar in all Python services (`api-gateway`, `bot-manager`, `transcription-collector`, `billing-service`).
+    *   **Key Events to Log (JSON format):**
+        *   `api-gateway`: API request start/end (user_id, endpoint, method, status_code, latency). Rate limit hit.
+        *   `bot-manager`: Bot start request (user_id, model_type), bot start success/failure (reason), bot stop request, concurrent limit hit, quota limit hit.
+        *   `transcription-collector`: Usage update published (user_id, model, duration). Errors processing stream.
+        *   `billing-service`: Usage record updated, quota check performed, plan created/updated. Errors consuming usage stream.
+
+3.  **Log Collection (`docker-compose.yml`):**
+    *   Add `Filebeat` or `Fluentd` service.
+    *   Configure volume mounts to access Docker container logs (e.g., `/var/lib/docker/containers`).
+    *   Configure processors to parse JSON logs and add necessary metadata.
+    *   Configure output to Elasticsearch or Loki.
+
+4.  **Storage & Visualization (`docker-compose.yml`):**
+    *   Add `Elasticsearch` & `Kibana` or `Loki` & `Grafana` services.
+    *   Build initial dashboards in Kibana/Grafana for:
+        *   API Usage (requests/min, errors, latency by user/endpoint).
+        *   Transcription Volume (minutes per model per user/plan).
+        *   Bot Activity (active bots, starts/stops).
+        *   Billing System Health (usage processing rate, errors).
+
+**Phase 6: Testing & Deployment**
+
+1.  **Unit Tests:** Cover new logic: rate limiting, quota checks, usage calculation, stream processing, DB CRUD operations, API endpoint logic.
+2.  **Integration Tests:** Test interactions between services:
+    *   API Gateway <-> Admin API/Billing Service (Auth & Limits).
+    *   Bot Manager <-> Billing Service (Concurrency & Quota).
+    *   WhisperLive -> Collector -> Billing Service (Usage Pipeline).
+3.  **End-to-End Tests:** Simulate full user workflows:
+    *   Sign up, get assigned plan, hit rate limit, start bot, get transcription, exceed quota, view usage (if implemented).
+4.  **Deployment:**
+    *   Update CI/CD pipelines to build/test/deploy the new `billing-service`.
+    *   Handle database migrations for new tables/schemas.
+    *   Roll out configuration changes for existing services.
+    *   Deploy analytics stack if chosen.
+
+This plan provides a structured approach to implementing the required features across the Vexa microservices architecture. 
