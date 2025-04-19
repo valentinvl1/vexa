@@ -123,7 +123,21 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
   // Add type assertion for the object passed to evaluate
   await page.evaluate(async (config: BotConfig) => {
     // Destructure inside evaluate with types if needed, or just use config.* directly
-    const { meetingUrl, token, connectionId, platform, nativeMeetingId, language: initialLanguage, task: initialTask } = config;
+    const { meetingUrl, token, connectionId: originalConnectionId, platform, nativeMeetingId, language: initialLanguage, task: initialTask } = config;
+
+    // --- ADD Helper function to generate UUID in browser context ---
+    const generateUUID = () => {
+        if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+            return crypto.randomUUID();
+        } else {
+            // Basic fallback if crypto.randomUUID is not available
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+    };
+    // --- --------------------------------------------------------- ---
 
     await new Promise<void>((resolve, reject) => {
       try {
@@ -166,14 +180,19 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
         const stream = destinationNode.stream;
         (window as any).logBot(`Successfully combined ${sourcesConnected} audio streams.`);
 
-        // Ensure meetingUrl is not null before using btoa
-        // const uniquePart = connectionId || btoa(nativeMeetingId || meetingUrl || ''); // Added || '' fallback for null meetingUrl
-        // const structuredId = `${platform}_${uniquePart}`; // <-- REMOVE THIS LINE
-        const sessionUid = connectionId; // <-- USE connectionId DIRECTLY
+        // --- MODIFIED: Keep original connectionId but don't use it for WebSocket UID ---
+        // const sessionUid = connectionId; // <-- OLD: Reused original connectionId
+        (window as any).logBot(`Original bot connection ID: ${originalConnectionId}`);
+        // --- ------------------------------------------------------------------------ ---
 
         const wsUrl = "ws://whisperlive:9090";
-        (window as any).logBot(`Attempting to connect WebSocket to: ${wsUrl} with platform: ${platform}, session UID: ${sessionUid}`); // Log the correct UID
+        // (window as any).logBot(`Attempting to connect WebSocket to: ${wsUrl} with platform: ${platform}, session UID: ${sessionUid}`); // Log the correct UID
         
+        // --- ADD Browser-scope state for current WS config ---
+        let currentWsLanguage = initialLanguage;
+        let currentWsTask = initialTask;
+        // --- -------------------------------------------- ---
+
         let socket: WebSocket | null = null;
         let isServerReady = false;
         let retryCount = 0;
@@ -194,15 +213,18 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             socket = new WebSocket(wsUrl);
             
             socket.onopen = function() {
-              (window as any).logBot("WebSocket connection opened.");
+              // --- MODIFIED: Log current config being used --- 
+              // --- MODIFIED: Generate NEW UUID for this connection --- 
+              const currentSessionUid = generateUUID();
+              (window as any).logBot(`WebSocket connection opened. Using Lang: ${currentWsLanguage}, Task: ${currentWsTask}, New UID: ${currentSessionUid}`);
               retryCount = 0;
 
               if (socket) {
                 // Construct the initial configuration message using config values
                 const initialConfigPayload = {
-                    uid: sessionUid,            // Use connectionId
-                    language: initialLanguage || null, // Use language from config, default to null
-                    task: initialTask || 'transcribe', // Use task from config, default to 'transcribe'
+                    uid: currentSessionUid,       // <-- Use NEWLY generated UUID
+                    language: currentWsLanguage || null, // <-- Use browser-scope variable
+                    task: currentWsTask || 'transcribe', // <-- Use browser-scope variable
                     model: "medium",            // Keep default or make configurable if needed
                     use_vad: true,            // Keep default or make configurable if needed
                     platform: platform,           // From config
@@ -222,7 +244,13 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             socket.onmessage = (event) => {
               (window as any).logBot("Received message: " + event.data);
               const data = JSON.parse(event.data);
-              if (data["uid"] !== sessionUid) return; // <-- Check against sessionUid
+              // NOTE: The check `if (data["uid"] !== sessionUid) return;` is removed
+              // because we no longer have a single sessionUid for the lifetime of the evaluate block.
+              // Each message *should* contain the UID associated with the specific WebSocket
+              // connection it came from. Downstream needs to handle this if correlation is needed.
+              // For now, we assume messages are relevant to the current bot context.
+              // Consider re-introducing a check if whisperlive echoes back the UID and it's needed.
+              
               if (data["status"] === "ERROR") {
                  (window as any).logBot(`WebSocket Server Error: ${data["message"]}`);
               } else if (data["status"] === "WAIT") {
@@ -283,6 +311,28 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
             }
           }
         };
+        
+        // --- ADD Function exposed to Node.js for triggering reconfigure ---
+        (window as any).triggerWebSocketReconfigure = (newLang: string | null, newTask: string | null) => {
+            (window as any).logBot(`[Node->Browser] Received reconfigure. New Lang: ${newLang}, New Task: ${newTask}`);
+            currentWsLanguage = newLang; // Update browser state
+            currentWsTask = newTask || 'transcribe'; // Update browser state, default task if null
+
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                (window as any).logBot('[Node->Browser] Closing WebSocket to reconnect with new config.');
+                socket.close(); // Triggers onclose -> setupWebSocket which now reads updated vars
+            } else if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.CLOSING)) {
+                (window as any).logBot('[Node->Browser] Socket is connecting or closing, cannot close now. Reconnect will use new config when it opens.');
+            } else {
+                 // Socket is null or already closed
+                 (window as any).logBot('[Node->Browser] Socket is null or closed. Attempting to setupWebSocket directly.');
+                 // Directly calling setupWebSocket might cause issues if the old one is mid-retry
+                 // Relying on the existing retry logic in onclose is likely safer.
+                 // If setupWebSocket is called here, ensure it handles potential double connections.
+                 // setupWebSocket(); 
+            }
+        };
+        // --- ----------------------------------------------------------- ---
         
         setupWebSocket();
 

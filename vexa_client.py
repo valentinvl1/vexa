@@ -170,6 +170,33 @@ class VexaClient:
         # _request handles 202 status and returns the JSON body
         return self._request("DELETE", path, api_type='user')
 
+    def update_bot_config(self, platform: str, native_meeting_id: str, language: Optional[str] = None, task: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Updates the configuration (language, task) for an active bot.
+        The API returns a 202 Accepted response immediately while the command is sent.
+
+        Args:
+            platform: Platform identifier (e.g., 'google_meet').
+            native_meeting_id: The platform-specific meeting identifier.
+            language: Optional new language code (e.g., 'en', 'es'). Pass None to not update.
+            task: Optional new task ('transcribe' or 'translate'). Pass None to not update.
+
+        Returns:
+            A dictionary containing a confirmation message (e.g., {"message": "..."}).
+        """
+        path = f"/bots/{platform}/{native_meeting_id}/config"
+        payload = {}
+        if language is not None:
+            payload["language"] = language
+        if task is not None:
+            payload["task"] = task
+            
+        if not payload: # Check if there's anything to update
+            raise VexaClientError("No configuration updates provided (language or task must be specified).")
+            
+        # _request handles 202 status and returns the JSON body
+        return self._request("PUT", path, api_type='user', json_data=payload)
+
     # --- Transcriptions ---
 
     def get_meetings(self) -> List[Dict[str, Any]]:

@@ -7,7 +7,8 @@ import os
 import base64
 from typing import Optional
 import redis.asyncio as aioredis
-import asyncio # <--- Import asyncio
+import asyncio
+import json
 
 # Local imports - Remove unused ones
 # from app.database.models import init_db # Using local init_db now
@@ -17,12 +18,12 @@ import asyncio # <--- Import asyncio
 from config import BOT_IMAGE_NAME, REDIS_URL
 from docker_utils import get_socket_session, close_docker_client, start_bot_container, stop_bot_container, _record_session_start
 from shared_models.database import init_db, get_db, async_session_local
-from shared_models.models import User, Meeting # Import Meeting model
+from shared_models.models import User, Meeting, MeetingSession # <--- ADD MeetingSession import
 from shared_models.schemas import MeetingCreate, MeetingResponse, Platform # Import new schemas and Platform
 from auth import get_user_and_token # Import the new dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import and_
+from sqlalchemy import and_, desc
 from datetime import datetime # For start_time
 
 # Configure logging
@@ -44,12 +45,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- ADD Redis Client Global ---
+redis_client: Optional[aioredis.Redis] = None
+# --------------------------------
+
 # Pydantic models - Use schemas from shared_models
 # class BotRequest(BaseModel): ... -> Replaced by MeetingCreate
 # class BotResponse(BaseModel): ... -> Replaced by MeetingResponse
 
+# --- ADD Pydantic Model for Config Update ---
+class MeetingConfigUpdate(BaseModel):
+    language: Optional[str] = Field(None, description="New language code (e.g., 'en', 'es')")
+    task: Optional[str] = Field(None, description="New task ('transcribe' or 'translate')")
+# -------------------------------------------
+
 @app.on_event("startup")
 async def startup_event():
+    global redis_client # <-- Add global reference
     logger.info("Starting up Bot Manager...")
     # await init_db() # Removed - Admin API should handle this
     # await init_redis() # Removed redis init if not used elsewhere
@@ -57,12 +69,36 @@ async def startup_event():
         get_socket_session()
     except Exception as e:
         logger.error(f"Failed to initialize Docker client on startup: {e}", exc_info=True)
-    logger.info("Database and Docker Client initialized (attempted).")
+
+    # --- ADD Redis Client Initialization ---
+    try:
+        logger.info(f"Connecting to Redis at {REDIS_URL}...")
+        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        await redis_client.ping() # Verify connection
+        logger.info("Successfully connected to Redis.")
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis on startup: {e}", exc_info=True)
+        redis_client = None # Ensure client is None if connection fails
+    # --------------------------------------
+
+    logger.info("Database, Docker Client (attempted), and Redis Client (attempted) initialized.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global redis_client # <-- Add global reference
     logger.info("Shutting down Bot Manager...")
     # await close_redis() # Removed redis close if not used
+
+    # --- ADD Redis Client Closing ---
+    if redis_client:
+        logger.info("Closing Redis connection...")
+        try:
+            await redis_client.close()
+            logger.info("Redis connection closed.")
+        except Exception as e:
+            logger.error(f"Error closing Redis connection: {e}", exc_info=True)
+    # ---------------------------------
+
     close_docker_client()
     logger.info("Docker Client closed.")
 
@@ -210,6 +246,116 @@ async def request_bot(
             detail={"status": "error", "message": f"An unexpected error occurred during bot startup: {str(e)}", "meeting_id": meeting_id}
         )
 
+# --- ADD PUT Endpoint for Reconfiguration ---
+@app.put("/bots/{platform}/{native_meeting_id}/config",
+         status_code=status.HTTP_202_ACCEPTED,
+         summary="Update configuration for an active bot",
+         description="Updates the language and/or task for an active bot associated with the platform and native meeting ID. Sends a command via Redis Pub/Sub.",
+         dependencies=[Depends(get_user_and_token)])
+async def update_bot_config(
+    platform: Platform,
+    native_meeting_id: str,
+    req: MeetingConfigUpdate,
+    auth_data: tuple[str, User] = Depends(get_user_and_token),
+    db: AsyncSession = Depends(get_db)
+):
+    global redis_client # Access global redis client
+    user_token, current_user = auth_data
+
+    logger.info(f"User {current_user.id} requesting config update for {platform.value}/{native_meeting_id}: lang={req.language}, task={req.task}")
+
+    # 1. Find the LATEST active meeting for this user/platform/native_id
+    active_meeting_stmt = select(Meeting).where(
+        Meeting.user_id == current_user.id,
+        Meeting.platform == platform.value,
+        Meeting.platform_specific_id == native_meeting_id,
+        Meeting.status == 'active' # Must be active to reconfigure
+    ).order_by(Meeting.created_at.desc()) # <-- ADDED: Order by created_at descending
+    
+    result = await db.execute(active_meeting_stmt)
+    active_meeting = result.scalars().first() # Takes the most recent one
+
+    if not active_meeting:
+        logger.warning(f"No active meeting found for user {current_user.id}, {platform.value}/{native_meeting_id} to reconfigure.")
+        # Check if exists but wrong status
+        existing_stmt = select(Meeting.status).where(
+            Meeting.user_id == current_user.id,
+            Meeting.platform == platform.value,
+            Meeting.platform_specific_id == native_meeting_id
+        ).order_by(Meeting.created_at.desc()).limit(1)
+        existing_res = await db.execute(existing_stmt)
+        existing_status = existing_res.scalars().first()
+        if existing_status:
+             detail = f"Meeting found but is not active (status: '{existing_status}'). Cannot reconfigure."
+             status_code = status.HTTP_409_CONFLICT
+        else:
+             detail = f"No active meeting found for platform {platform.value} and meeting ID {native_meeting_id}."
+             status_code = status.HTTP_404_NOT_FOUND
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    internal_meeting_id = active_meeting.id
+    logger.info(f"[DEBUG] Found active meeting record with internal ID: {internal_meeting_id}")
+
+    # 2. Find the LATEST session_uid (connectionId) for this meeting - CHANGED TO EARLIEST
+    # latest_session_stmt = select(MeetingSession.session_uid).where(
+    #     MeetingSession.meeting_id == internal_meeting_id
+    # ).order_by(MeetingSession.session_start_time.desc()).limit(1)
+    # --- Get the EARLIEST session for this meeting ID --- 
+    earliest_session_stmt = select(MeetingSession.session_uid).where(
+        MeetingSession.meeting_id == internal_meeting_id
+    ).order_by(MeetingSession.session_start_time.asc()).limit(1) # Order ASC, take first
+
+    session_result = await db.execute(earliest_session_stmt)
+    # Rename variable for clarity
+    original_session_uid = session_result.scalars().first() 
+
+    # ++ ADDED: Log the specific session UID found (changed var name) ++
+    logger.info(f"[DEBUG] Found earliest session UID (should be original connectionId) '{original_session_uid}' for meeting {internal_meeting_id}")
+    # +++++++++++++++++++++++++++++++++++++++++++++
+
+    if not original_session_uid:
+        logger.error(f"Active meeting {internal_meeting_id} found, but no associated session UID in MeetingSession table. Cannot send command.")
+        # This indicates an inconsistent state
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Meeting is active but session information is missing. Cannot process reconfiguration."
+        )
+
+    # logger.info(f"Found latest session UID {latest_session_uid} for meeting {internal_meeting_id}.") # Removed old log
+
+    # 3. Construct and Publish command
+    if not redis_client:
+        logger.error("Redis client not available. Cannot publish reconfigure command.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cannot connect to internal messaging service to send command."
+        )
+
+    command_payload = {
+        "action": "reconfigure",
+        "uid": original_session_uid, # Use the original UID in the payload (for the bot handler, if needed? Seems unused there now)
+        "language": req.language,
+        "task": req.task
+    }
+    # Publish to the channel the bot SUBSCRIBED to (using original UID)
+    channel = f"bot_commands:{original_session_uid}"
+
+    try:
+        payload_str = json.dumps(command_payload)
+        logger.info(f"Publishing command to channel '{channel}': {payload_str}")
+        await redis_client.publish(channel, payload_str)
+        logger.info(f"Successfully published reconfigure command for session {original_session_uid}.") # Log original UID
+    except Exception as e:
+        logger.error(f"Failed to publish reconfigure command to Redis channel {channel}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send reconfiguration command to the bot."
+        )
+
+    # 4. Return 202 Accepted
+    return {"message": "Reconfiguration request accepted and sent to the bot."}
+# -------------------------------------------
+
 # --- Background Task for Stopping Container ---
 async def _handle_container_stop(meeting_id: int, container_id: str):
     """
@@ -268,7 +414,6 @@ async def _handle_container_stop(meeting_id: int, container_id: str):
                 logger.error(f"[Background Task] Could not find meeting {meeting_id} to update final status.")
         except Exception as e:
             logger.error(f"[Background Task] DB error updating final status for meeting {meeting_id}: {e}", exc_info=True)
-
 
 @app.delete("/bots/{platform}/{native_meeting_id}",
              # Change status code to 202 Accepted if we want to strictly follow async pattern

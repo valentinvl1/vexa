@@ -5,6 +5,7 @@ import { handleGoogleMeet } from "./platforms/google";
 import { browserArgs, userAgent } from "./constans";
 import { BotConfig } from "./types";
 import { createClient, RedisClientType } from 'redis';
+import { Page } from 'playwright-core';
 
 // Module-level variables to store current configuration
 let currentLanguage: string | null | undefined = null;
@@ -21,9 +22,52 @@ let redisSubscriber: RedisClientType | null = null;
 // -----------------------------------
 
 // --- ADDED: Message Handler ---
-const handleRedisMessage = (message: string, channel: string) => {
+// --- MODIFIED: Make async and add page parameter ---
+const handleRedisMessage = async (message: string, channel: string, page: Page | null) => {
+  // ++ ADDED: Log entry into handler ++
+  log(`[DEBUG] handleRedisMessage entered for channel ${channel}. Message: ${message.substring(0, 100)}...`);
+  // ++++++++++++++++++++++++++++++++++
   log(`Received command on ${channel}: ${message}`);
-  // TODO: Implement actual command handling (Phase 3 & 4)
+  // --- ADDED: Implement reconfigure command handling --- 
+  try {
+      const command = JSON.parse(message);
+      if (command.action === 'reconfigure') {
+          log(`Processing reconfigure command: Lang=${command.language}, Task=${command.task}`);
+
+          // Update Node.js state
+          currentLanguage = command.language;
+          currentTask = command.task;
+
+          // Trigger browser-side reconfiguration via the exposed function
+          if (page && !page.isClosed()) { // Ensure page exists and is open
+              try {
+                  await page.evaluate(
+                      ([lang, task]) => {
+                          if (typeof (window as any).triggerWebSocketReconfigure === 'function') {
+                              (window as any).triggerWebSocketReconfigure(lang, task);
+                          } else {
+                              console.error('[Node Eval Error] triggerWebSocketReconfigure not found on window.');
+                              // Optionally log via exposed function if available
+                              (window as any).logBot?.('[Node Eval Error] triggerWebSocketReconfigure not found on window.');
+                          }
+                      },
+                      [currentLanguage, currentTask] // Pass new config as argument array
+                  );
+                  log("Sent reconfigure command to browser context via page.evaluate.");
+              } catch (evalError: any) {
+                  log(`Error evaluating reconfiguration script in browser: ${evalError.message}`);
+              }
+          } else {
+               log("Page not available or closed, cannot send reconfigure command to browser.");
+          }
+      } else if (command.action === 'leave') {
+        // TODO: Implement leave logic (Phase 4)
+        log("Received leave command (Phase 4 - TODO)");
+      }
+  } catch (e: any) {
+      log(`Error processing Redis message: ${e.message}`);
+  }
+  // -------------------------------------------------
 };
 // ----------------------------
 
@@ -47,12 +91,24 @@ export async function runBot(botConfig: BotConfig): Promise<void> {
       redisSubscriber = createClient({ url: currentRedisUrl });
 
       redisSubscriber.on('error', (err) => log(`Redis Client Error: ${err}`));
+      // ++ ADDED: Log connection events ++
+      redisSubscriber.on('connect', () => log('[DEBUG] Redis client connecting...'));
+      redisSubscriber.on('ready', () => log('[DEBUG] Redis client ready.'));
+      redisSubscriber.on('reconnecting', () => log('[DEBUG] Redis client reconnecting...'));
+      redisSubscriber.on('end', () => log('[DEBUG] Redis client connection ended.'));
+      // ++++++++++++++++++++++++++++++++++
 
       await redisSubscriber.connect();
       log(`Connected to Redis at ${currentRedisUrl}`);
 
       const commandChannel = `bot_commands:${currentConnectionId}`;
-      await redisSubscriber.subscribe(commandChannel, handleRedisMessage);
+      // Pass the page object when subscribing
+      // ++ MODIFIED: Add logging inside subscribe callback ++
+      await redisSubscriber.subscribe(commandChannel, (message, channel) => {
+          log(`[DEBUG] Redis subscribe callback fired for channel ${channel}.`); // Log before handling
+          handleRedisMessage(message, channel, page)
+      }); 
+      // ++++++++++++++++++++++++++++++++++++++++++++++++
       log(`Subscribed to Redis channel: ${commandChannel}`);
 
     } catch (err) {

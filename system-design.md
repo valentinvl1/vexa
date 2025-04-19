@@ -4,7 +4,7 @@ This document outlines the architecture of the Vexa application based on its Doc
 
 ## Overview
 
-Vexa is a multi-service application orchestrated using Docker Compose. It primarily provides real-time transcription capabilities, alongside administrative functions and bot management. Key technologies include Python (FastAPI for backend services), Whisper (for transcription via WhisperLive), Redis (for messaging via Streams and temporary storage via Hashes/Sets), PostgreSQL (for persistent storage), and Traefik (as a reverse proxy/load balancer).
+Vexa is a multi-service application orchestrated using Docker Compose. It primarily provides real-time transcription capabilities, alongside administrative functions and bot management. Key technologies include Python (FastAPI for backend services), Whisper (for transcription via WhisperLive), Redis (for messaging via Streams and Pub/Sub, and temporary storage via Hashes/Sets), PostgreSQL (for persistent storage), and Traefik (as a reverse proxy/load balancer).
 
 ## Services
 
@@ -19,6 +19,7 @@ The system is composed of the following services:
 *   **Routing Logic**:
     *   Uses a generic `forward_request` helper.
     *   `POST /bots`, `DELETE /bots/...`: Forwards to `bot-manager`.
+    *   `PUT /bots/{platform}/{native_meeting_id}/config`: Forwards to `bot-manager` for runtime reconfiguration.
     *   `GET /meetings`, `GET /transcripts/...`: Forwards to `transcription-collector`.
     *   `/admin/*` (all methods): Forwards to `admin-api`.
 *   **Authentication Handling**:
@@ -50,62 +51,78 @@ The system is composed of the following services:
 
 ### 3. `bot-manager`
 
-*   **Purpose**: Provides an API to manage the lifecycle (start, stop) of `vexa-bot` container instances based on user requests. Acts as a controller for the headless browser bots.
+*   **Purpose**: Provides an API to manage the lifecycle (start, stop, reconfigure) of `vexa-bot` container instances based on user requests. Acts as a controller for the headless browser bots.
 *   **Build**: `services/bot-manager/Dockerfile`
-*   **API Endpoints**: Exposes `/bots` (POST to start, DELETE to stop by platform/native ID).
+*   **API Endpoints**:
+    *   `POST /bots`: Start a bot.
+    *   `DELETE /bots/{platform}/{native_meeting_id}`: Stop a bot.
+    *   `PUT /bots/{platform}/{native_meeting_id}/config`: Update `language`/`task` for an active bot.
 *   **Authentication**: Authenticates incoming API requests using user tokens sent in the `X-API-Key` header. It verifies the token against the `APIToken` table and retrieves the associated `User` from the `User` table in PostgreSQL (via `auth.py`).
 *   **Database Interaction**: Uses PostgreSQL (`shared_models`) to:
-    *   Track meeting state (`Meeting` table).
+    *   Track meeting state (`Meeting` table: `id`, `user_id`, `platform`, `platform_specific_id`, `status`, `bot_container_id`, `start_time`, `end_time`, etc.).
+    *   Track bot sessions (`MeetingSession` table: `meeting_id`, `session_uid`, `session_start_time`). A new record is created by `bot-manager` on initial bot start and by `transcription-collector` upon receiving `session_start` events for subsequent WebSocket connections.
     *   Prevent duplicate active bot sessions for the same user/platform/native ID.
-    *   Store the `bot_container_id` and status (`requested`, `active`, `stopped`, `error`).
-*   **Docker Interaction**: Uses `docker-py` (via `docker_utils.py`) to communicate with the host's Docker daemon (mounted `/var/run/docker.sock`):
+*   **Docker Interaction**: Uses `requests_unixsocket` (via `docker_utils.py`) to communicate with the host's Docker daemon (mounted `/var/run/docker.sock`):
     *   Starts `vexa-bot` containers (`BOT_IMAGE=vexa-bot:latest`) upon valid POST requests.
-    *   Passes necessary context (internal meeting ID, native meeting ID, platform, constructed meeting URL, user token, bot name, `REDIS_URL`, and the target WebSocket URL for WhisperLive, `ws://whisperlive:9090`) to the bot container via environment variables.
-    *   Stops the corresponding bot container upon valid DELETE requests.
-*   **Redis Interaction**: Uses Redis for:
-    *   Celery Task Queue & Backend: Leveraged by `app/tasks/monitoring.py` for background task management (if Celery is actively used).
-    *   Distributed Locking & Mapping: `redis_utils.py` provides functions to lock operations per meeting ID and map meeting IDs to container IDs. **Key Issue**: The initialization function (`init_redis`) for this specific client appears to be commented out in `main.py`, meaning this functionality (locking/mapping) is currently **inactive**. A separate `aioredis` client instance will need to be initialized for the planned Pub/Sub command functionality.
-    *   **Planned Pub/Sub**: `PLAN.md` outlines using Redis Pub/Sub for sending commands (`reconfigure`, `leave`) from `bot-manager` to `vexa-bot`. The `REDIS_URL` environment variable is configured in `docker-compose.yml` and intended to be passed to `vexa-bot` to enable this functionality.
-*   **Dependencies**: `redis` (started - required for planned Pub/Sub), `postgres` (healthy), Docker daemon access.
+    *   Generates an initial unique `connectionId`, passes it (and other context like `REDIS_URL`, `WHISPER_LIVE_URL`, meeting details, token) via `BOT_CONFIG` environment variable to the bot container.
+    *   Records the initial `connectionId` and start time in the `MeetingSession` table.
+    *   Stops the corresponding bot container upon valid DELETE requests (current implementation is immediate stop via background task; Phase 4 plans delayed stop).
+*   **Redis Interaction**: Uses Redis (`aioredis` client initialized in `main.py`) for:
+    *   **Pub/Sub Commands:**
+        *   On `PUT /bots/.../config`, finds the most recent *active* `Meeting` record.
+        *   Finds the *earliest* `MeetingSession` record associated with that `Meeting` to retrieve the original `connectionId` (which `vexa-bot` used to subscribe).
+        *   Publishes a `reconfigure` command (`{"action": "reconfigure", "language": ..., "task": ...}`) to the Redis channel `bot_commands:{original_connectionId}`.
+    *   *(Celery Task Queue & Backend: Possibly used by `app/tasks/monitoring.py`, if active).*
+    *   *(Distributed Locking & Mapping: `redis_utils.py` exists but its client init is commented out in `main.py`, functionality inactive).*
+*   **Dependencies**: `redis` (started), `postgres` (healthy), Docker daemon access.
 *   **Key Config**:
     *   Uses `BOT_IMAGE=vexa-bot:latest` to identify the bot image.
-    *   Connects to `postgres`. Needs `aioredis` client initialized for planned Pub/Sub to `redis`.
+    *   Connects to `postgres`. Connects to `redis` via `aioredis` for Pub/Sub.
     *   Requires access to the host's Docker daemon via `/var/run/docker.sock` (mounted volume) and `DOCKER_HOST` environment variable.
-    *   Specifies `DOCKER_NETWORK=vexa_vexa_default` for the managed bot containers. **Note**: While connecting `vexa-bot` directly to `vexa_default` might seem simpler, the current configuration using `vexa_vexa_default` is functional.
+    *   Specifies `DOCKER_NETWORK=vexa_vexa_default` for the managed bot containers.
 *   **Network**: `vexa_default`
 
 ### 3a. `vexa-bot` (Managed Container Image)
 
-*   **Purpose**: Headless browser automation bot designed to join online meetings (currently Google Meet implemented in `platforms/google.ts`). It captures raw audio streams for transcription.
-*   **Technology**: Node.js/TypeScript application using the Playwright framework.
+*   **Purpose**: Headless browser automation bot designed to join online meetings (currently Google Meet implemented in `platforms/google.ts`). Captures audio streams for transcription and responds to runtime commands via Redis.
+*   **Technology**: Node.js/TypeScript application using Playwright (`playwright-extra`) and `redis`.
 *   **Execution**: Runs within a container based on `services/vexa-bot/core/Dockerfile`. Uses Xvfb (virtual framebuffer) to run the browser headlessly. Includes PulseAudio and FFmpeg.
-*   **Control**: Launched and stopped by the `bot-manager` service. Receives meeting context, user token (`X-API-Key`), IDs, the `REDIS_URL` (for planned command/control), and the target `WHISPER_LIVE_URL` (`ws://whisperlive:9090`) from `bot-manager` upon startup.
+*   **Control**: Launched and stopped by `bot-manager`. Receives meeting context, user token, initial `connectionId`, `REDIS_URL`, and `WHISPER_LIVE_URL` via the `BOT_CONFIG` environment variable.
 *   **Interaction**:
     *   Connects to the specified meeting URL using Playwright.
-    *   Uses Web Audio API (`AudioContext`, `MediaRecorder`, etc. within `platforms/google.ts`) to capture raw audio from the meeting.
-    *   **Establishes WebSocket** connection to `WHISPER_LIVE_URL` (`ws://whisperlive:9090`).
-    *   **Sends initial configuration** (including `language`, `task`, `connectionId` as `uid`, `platform`, `meetingUrl`, `token`, `nativeMeetingId`) as a JSON message immediately after connection.
+    *   Uses Web Audio API (`AudioContext`, `MediaRecorder`, etc. within `platforms/google.ts`) to capture and mix audio streams.
+    *   **Establishes WebSocket** connection(s) to `WHISPER_LIVE_URL` (`ws://whisperlive:9090`).
+    *   **WebSocket Session Handling:** For *each* WebSocket connection (initial and subsequent reconnections triggered by `reconfigure` commands), it:
+        *   Generates a **new unique UUID**.
+        *   Sends this **new UUID** as the `uid` field in the initial JSON configuration message sent over the WebSocket (along with current `language`, `task`, `platform`, `meeting_id`, `token`, etc.).
     *   Sends captured audio chunks via WebSocket to `whisperlive`.
-    *   Listens for commands (`reconfigure`, `leave`) via Redis Pub/Sub on channel `bot_commands:{connectionId}` (as per `PLAN.md`).
-    *   The file `transcript-adapter.js` exists but appears unused; it contains logic to send *text* captions via HTTP, likely from a previous implementation.
-*   **Network**: Launched onto `vexa_vexa_default` by `bot-manager`. Needs access to `whisperlive` and `redis` (both typically on `vexa_default`). The current setup functions, indicating necessary connectivity exists between `vexa_vexa_default` and `vexa_default`.
+    *   **Redis Command Subscription:**
+        *   Connects to Redis using `REDIS_URL`.
+        *   Subscribes to the unique Redis Pub/Sub channel `bot_commands:{original_connectionId}` (using the `connectionId` received at startup).
+        *   Listens for JSON command messages (`{"action": "reconfigure", ...}`, `{"action": "leave", ...}`).
+        *   On `reconfigure`: Updates internal state (`language`/`task`) and triggers a WebSocket reconnection (which uses the new state and generates a new `uid`).
+    *   *(The file `transcript-adapter.js` exists but appears unused).*
+*   **Network**: Launched onto `vexa_vexa_default` by `bot-manager`. Needs access to `whisperlive` and `redis` (both typically on `vexa_default`).
 
 ### 4. `whisperlive`
 
-*   **Purpose**: Performs real-time audio transcription using the `faster-whisper` backend. It is configured to publish transcription segments to a Redis Stream.
+*   **Purpose**: Performs real-time audio transcription using the `faster-whisper` backend. Receives audio via WebSocket, publishes transcription segments and session start events to a Redis Stream.
 *   **Build**: `services/WhisperLive/Dockerfile.project`
 *   **Ports**: Exposes `9090` (service) and `9091` (healthcheck) internally. Accessible externally via `traefik` on host port `9090`.
-*   **Dependencies**: `transcription-collector` (started - unusual for producer to depend on consumer, likely for startup order), `redis` (implicitly, for stream publishing)
-*   **Deployment**: Configured for **3 replicas** via `docker-compose.yml` (`replicas: 3`). *Note: This may cause GPU contention if only one GPU (`device_ids: ['3']`) is available/assigned across all replicas.*
+*   **Dependencies**: `transcription-collector` (started), `redis` (implicitly).
+*   **Deployment**: Configured for 1 replica in `docker-compose.yml` (`replicas: 1`).
 *   **Key Config**:
-    *   Receives audio input via WebSocket on port 9090. **Accepts initial JSON configuration message** upon connection containing `language`, `task`, `uid`, `token`, `platform`, `meeting_id`, etc.
-    *   Uses Redis Streams (`REDIS_STREAM_URL`, `REDIS_STREAM_NAME=transcription_segments`) for *outputting* transcription segments, as specified by environment variables.
+    *   Receives audio input via WebSocket on port 9090.
+    *   **Accepts initial JSON configuration message** upon connection containing `language`, `task`, `uid`, `token`, `platform`, `meeting_id`, etc. (The `uid` received identifies a specific WebSocket connection instance).
+    *   Uses Redis Streams (`REDIS_STREAM_URL`, `REDIS_STREAM_NAME=transcription_segments`) for outputting:
+        *   `session_start` events: Published upon receiving a new WebSocket connection, containing the connection's `uid` and other metadata.
+        *   `transcription` segments: Published as transcriptions are generated, associated with the connection's `uid`.
     *   Loads a specific `faster-whisper` model from a mounted cache/model directory.
-    *   Configurable VAD threshold and language detection segments via environment variables.
-    *   **Major Issue**: Configured for Redis Stream *output*. The mechanism for receiving audio *input* from `vexa-bot` is currently misaligned/broken (`vexa-bot` attempts WebSocket, `whisperlive` has no defined WebSocket audio input and is not configured to receive audio via Redis Pub/Sub or Streams).
+    *   Configurable VAD threshold and language detection segments.
+    *   *(Major Issue regarding WebSocket input vs Stream output seems resolved or misunderstood - WebSocket input is used, Stream output is used)*.
 *   **Healthcheck**: `http://localhost:9091/health`
 *   **Network**: `vexa_default`, `whispernet`. *(Note: `whispernet` appears redundant)*.
-*   **Traefik Integration**: Uses labels for service discovery by `traefik`, routing traffic from `whisperlive.localhost`. The WebSocket upgrade headers configured via labels are functional for the initial connection and subsequent audio streaming.
+*   **Traefik Integration**: Uses labels for service discovery by `traefik`, routing traffic from `whisperlive.localhost`.
 
 ### 5. `traefik`
 
@@ -122,26 +139,30 @@ The system is composed of the following services:
 
 ### 6. `transcription-collector`
 
-*   **Purpose**: Consumes transcription segments from the Redis Stream published by `whisperlive`. It validates messages, processes segments, stores them temporarily in Redis (Hashes for segments, Sets for active meeting tracking), acknowledges messages on the stream, and uses a background task to filter (using base rules and optional `filter_config.py`) and persist immutable segments to PostgreSQL. Also provides API endpoints for retrieving meetings and transcripts.
+*   **Purpose**: Consumes events (`session_start`, `transcription`) from the `transcription_segments` Redis Stream. Processes transcription segments, stores them temporarily in Redis Hashes, persists them to PostgreSQL, and handles session records. Provides API endpoints for retrieving meetings and transcripts.
 *   **Technology**: FastAPI (Python).
 *   **Build**: `services/transcription-collector/Dockerfile`
 *   **Ports**: Host `8123` -> Container `8000`
 *   **Dependencies**: `redis` (started), `postgres` (healthy)
 *   **Key Config**:
-    *   Connects to `postgres` for database interactions (user/meeting lookup, persistent storage).
-    *   Connects to `redis` to consume from the `REDIS_STREAM_NAME` (`transcription_segments`) stream using `REDIS_CONSUMER_GROUP` (`collector_group`) and `CONSUMER_NAME` (`collector-main`).
-    *   Uses Redis Hashes (`meeting:{id}:segments`) and Sets (`active_meetings`).
-    *   Configurable parameters for stream reading (`REDIS_STREAM_READ_COUNT`, `REDIS_STREAM_BLOCK_MS`), stale message handling (`PENDING_MSG_TIMEOUT_MS`), background task interval (`BACKGROUND_TASK_INTERVAL`), segment immutability threshold (`IMMUTABILITY_THRESHOLD`), and Redis segment TTL (`REDIS_SEGMENT_TTL`).
+    *   Connects to `postgres` for database interactions.
+    *   Connects to `redis` to consume from the `REDIS_STREAM_NAME` stream using `REDIS_CONSUMER_GROUP`.
+    *   **Stream Processing:**
+        *   Processes `session_start` events: Looks up the corresponding `Meeting`. Creates a new `MeetingSession` record in PostgreSQL using the `uid` and `start_timestamp` from the event if one doesn't already exist for that specific `meeting_id` and `uid`. Updates the timestamp if it does exist.
+        *   Processes `transcription` events: Looks up user/meeting, stores segments in Redis Hash (`meeting:{id}:segments`), adds meeting ID to `active_meetings` Set.
+    *   Background task (`process_redis_to_postgres`) filters and moves immutable segments from Redis Hashes to the `Transcription` table in PostgreSQL.
+    *   Configurable parameters for stream reading, stale message handling, background task interval, segment immutability, and Redis TTL.
     *   *(Note: `REDIS_CLEANUP_THRESHOLD` defined in `docker-compose.yml` is confirmed to be unused in the code)*.
 *   **Network**: `vexa_default`
 
 ### 7. `redis`
 
 *   **Purpose**: In-memory data store used for:
-    *   Message Brokering: Via Redis Streams (`transcription_segments`) for `whisperlive` -> `transcription-collector`.
-    *   Temporary Segment Storage: Via Redis Hashes (`meeting:{id}:segments`) used by `transcription-collector`.
-    *   Active Meeting Tracking: Via Redis Sets (`active_meetings`) used by `transcription-collector`.
-    *   Caching/Session Management (Potentially by other services).
+    *   **Message Brokering (Streams):** `transcription_segments` stream (`whisperlive` -> `transcription-collector`) carrying `session_start` and `transcription` events.
+    *   **Message Brokering (Pub/Sub):** `bot_commands:{connectionId}` channels (`bot-manager` -> `vexa-bot`) carrying `reconfigure` and `leave` commands.
+    *   Temporary Segment Storage: Redis Hashes (`meeting:{id}:segments`) used by `transcription-collector`.
+    *   Active Meeting Tracking: Redis Sets (`active_meetings`) used by `transcription-collector`.
+    *   *(Caching/Session Management: Potentially by other services).*
 *   **Image**: `redis:7.0-alpine`
 *   **Persistence**: Uses append-only file (`--appendonly yes`) stored in the `redis-data` volume.
 *   **Network**: `vexa_default`
@@ -194,83 +215,53 @@ Based on imports in `transcription-collector` (likely defined in `shared_models/
 *   **`ErrorResponse`**: (Imported but potentially unused or used implicitly by FastAPI) Standard structure for returning error details.
 *   **`WhisperLiveData`**: (Imported but not directly used for stream parsing) Represents the expected structure of the *entire payload* coming from WhisperLive *before* it's processed segment by segment by the collector. Might contain fields like `uid`, `platform`, `meeting_id`, `token`, and a list of raw segment dictionaries.
 
-## Data Flow (Transcription Example)
+## Data Flow (Transcription & Reconfiguration Example)
 
-**Vexa Bot Audio Capture & Sending:**
+**Initial Bot Start & Transcription:**
 
-1.  `bot-manager` starts a `vexa-bot` container (running Node.js/Playwright) on the `vexa_vexa_default` network, passing context via the `BOT_CONFIG` environment variable, including the meeting URL, user token, `platform`, `nativeMeetingId`, and a unique `connectionId`.
-2.  `vexa-bot` joins the meeting (e.g., Google Meet).
-3.  Code within `vexa-bot` (`platforms/google.ts`) uses the Web Audio API to capture raw audio streams from the meeting's `<audio>`/`<video>` elements.
-4.  The bot establishes a WebSocket connection to `ws://whisperlive:9090` (configured via `WHISPER_LIVE_URL` env var).
-5.  The bot sends an initial JSON configuration message containing `language`, `task` (from `BOT_CONFIG` or defaults), `connectionId` (as `uid`), `token`, `platform`, `meeting_id` (native ID), etc.
-6.  The bot processes audio chunks and sends them via the established WebSocket to `whisperlive`.
+1.  `bot-manager` receives `POST /bots`, generates unique `connectionId` (e.g., `conn_A`), starts `vexa-bot` container passing `conn_A`, `REDIS_URL` etc. Records `conn_A` in `MeetingSession` table (Session A).
+2.  `vexa-bot` starts, connects to Redis, subscribes to `bot_commands:conn_A`.
+3.  `vexa-bot` joins meeting, establishes *first* WebSocket connection to `whisperlive`.
+4.  `vexa-bot` generates *new UUID* (e.g., `uid_1`), sends initial WebSocket config message with `uid: uid_1`, language, task, etc.
+5.  `whisperlive` receives connection, publishes `session_start` event with `uid: uid_1` to Redis Stream.
+6.  `transcription-collector` consumes `session_start` event, finds no session with `uid: uid_1`, creates new `MeetingSession` record (Session B) with `uid: uid_1`.
+7.  `vexa-bot` sends audio via WebSocket. `whisperlive` processes it, publishes `transcription` events with `uid: uid_1` to Redis Stream.
+8.  `transcription-collector` consumes `transcription` events, validates token/meeting using `uid_1` metadata (implicitly via lookup), stores segments in Redis Hash associated with the meeting.
 
-**WhisperLive Processing & Publishing:**
+**Runtime Reconfiguration:**
 
-1.  A `whisperlive` replica receives the WebSocket connection and the initial JSON configuration via its server implementation (`server.py` listening on port 9090). It uses the `language` and `task` from the config.
-2.  `whisperlive` receives subsequent audio data via the WebSocket.
-3.  The `whisperlive` replica processes the audio, performs transcription using `faster-whisper` (using the configured `language`/`task`), potentially applying VAD.
-4.  `whisperlive` prepares a payload containing segments and metadata (using `platform`, `meeting_id`, `token`, `uid` received in the initial config).
-5.  The entire data dictionary is serialized to a JSON string.
-6.  This JSON string is published as the value of a field named `payload` to the `transcription_segments` Redis Stream using the `XADD` command on the `redis` service (using the `collector_client`).
-
-**Transcription Collector Processing:**
-
-1.  The `transcription-collector` service runs two primary background tasks upon startup: `consume_redis_stream` and `process_redis_to_postgres`.
-2.  **`consume_redis_stream` Task:**
-    *   Connects to the `redis` service and enters a loop, blocking on `XREADGROUP` to read new messages from the `transcription_segments` stream using its consumer group (`collector_group`) and name (`collector-main`).
-    *   Upon receiving messages, it iterates through them.
-    *   For each message, it calls the `process_stream_message` helper function.
-3.  **`process_stream_message` Helper:**
-    *   Parses the JSON `payload` from the stream message data.
-    *   Validates required fields (`platform`, `meeting_id`, `token`, `segments`).
-    *   Authenticates the `token` and looks up the `User` and internal `Meeting.id` via PostgreSQL.
-    *   Iterates through the raw `segments` array:
-        *   Validates segment structure and time formats.
-        *   Formats segment data (start time as key, JSON string of text/end_time/language/updated_at as value).
-    *   If valid segments exist:
-        *   Executes a Redis **pipeline** (`transaction=True`):
-            *   `SADD active_meetings {internal_meeting_id}`: Adds the meeting ID to the set of active meetings.
-            *   `EXPIRE meeting:{internal_meeting_id}:segments {TTL}`: Sets/updates the TTL on the hash key (may return `False` if the key doesn't exist yet, which is handled).
-            *   `HSET meeting:{internal_meeting_id}:segments {start_time1} {segment_json1} ...`: Stores/overwrites the processed segments in the Redis Hash.
-        *   Checks the pipeline results: Only considers it a failure if any command returned `None`. A `False` return from `EXPIRE` is accepted.
-    *   Returns `True` if processing was successful (or if it was a non-recoverable data error), `False` if a potentially recoverable error occurred (e.g., Redis connection issue, critical pipeline failure).
-4.  **Back in `consume_redis_stream` Task:**
-    *   If `process_stream_message` returned `True`, the message ID is added to a list for acknowledgment.
-    *   After processing a batch of messages, it calls `XACK` on the `redis` service to acknowledge all successfully processed messages in that batch, removing them from the pending list for the consumer group.
-5.  **`claim_stale_messages` Function (Run at startup and potentially periodically):**
-    *   Uses `XPENDING` with an `idle` time (`PENDING_MSG_TIMEOUT_MS`) to find messages that were delivered but not acknowledged within the timeout.
-    *   Uses `XCLAIM` to take ownership of these stale messages.
-    *   Processes claimed messages using the same `process_stream_message` helper.
-    *   Acknowledges successfully processed claimed messages using `XACK`.
-6.  **`process_redis_to_postgres` Background Task:**
-    *   Runs periodically (every `BACKGROUND_TASK_INTERVAL` seconds).
-    *   Gets active meeting IDs from the `active_meetings` Redis Set (`SMEMBERS`).
-    *   For each meeting ID:
-        *   Retrieves all segments from the corresponding Redis Hash (`HGETALL meeting:{id}:segments`).
-        *   If the hash is empty, removes the ID from `active_meetings` set (`SREM`).
-        *   Iterates through the segments in the hash:
-            *   Checks the `updated_at` timestamp within the segment's JSON data.
-            *   If `updated_at` is older than `datetime.utcnow() - IMMUTABILITY_THRESHOLD`, the segment is considered immutable.
-            *   Immutable segments are passed through a filtering process (`TranscriptionFilter` in `filters.py`):
-                *   Filters based on minimum character length, regex patterns (including optional `filter_config.py` patterns), minimum real words (excluding stopwords, potentially from `filter_config.py`), and optional custom functions from `filter_config.py`.
-            *   Segments passing filters are marked for deletion from the Redis Hash and added to a batch for PostgreSQL insertion.
-    *   If the batch contains segments:
-        *   Inserts the batch of `Transcription` objects into the PostgreSQL database within a transaction.
-        *   Upon successful commit, deletes the corresponding processed segments from their Redis Hashes using `HDEL`.
+1.  User sends `PUT /bots/.../config` with `{"language": "ru"}`.
+2.  `api-gateway` forwards to `bot-manager`.
+3.  `bot-manager` finds the active `Meeting` record, then finds the *earliest* `MeetingSession` record associated with it, retrieving `session_uid = conn_A`.
+4.  `bot-manager` publishes `{"action": "reconfigure", "language": "ru", ...}` to Redis Pub/Sub channel `bot_commands:conn_A`.
+5.  `vexa-bot` (listening on `bot_commands:conn_A`) receives the command via its Redis client.
+6.  `vexa-bot` handler updates its internal language state, calls browser function `triggerWebSocketReconfigure`.
+7.  Browser-side code closes the current WebSocket connection (`uid_1`).
+8.  `onclose` handler triggers reconnection (`setupWebSocket`).
+9.  `setupWebSocket` generates a *new UUID* (e.g., `uid_2`), sends initial WebSocket config message with `uid: uid_2` and `language: "ru"`.
+10. `whisperlive` receives new connection, publishes `session_start` event with `uid: uid_2`.
+11. `transcription-collector` consumes event, finds no session with `uid: uid_2`, creates new `MeetingSession` record (Session C) with `uid: uid_2`.
+12. Subsequent audio is processed by `whisperlive` using `language: "ru"`, and transcriptions are published with `uid: uid_2`.
 
 **Conclusion:**
 
-The data pipeline involves `vexa-bot` capturing raw audio via the Web Audio API, sending an initial config message and subsequent audio chunks via WebSocket to `whisperlive`. `whisperlive` receives this config and audio, performs transcription, and publishes the results to a Redis Stream. The `transcription-collector` consumes from this stream, processes the data, and stores it persistently. The planned Pub/Sub mechanism will provide a separate channel for control commands.
+The data pipeline involves `vexa-bot` capturing audio and sending it via WebSocket (each connection identified by a unique UUID) to `whisperlive`. `whisperlive` transcribes and publishes results (`session_start`, `transcription`) tagged with the connection's UUID to a Redis Stream. `transcription-collector` consumes this stream, creating distinct session records and storing transcriptions. Separately, `bot-manager` uses Redis Pub/Sub (targeting the bot's original `connectionId`) to send control commands (`reconfigure`, `leave`).
 
 **Key Issues Identified:**
 
-*   **`bot-manager` Redis Client**: The Redis client initialization for general use (locking/mapping via `redis_utils.py`) is commented out in `main.py` and thus inactive. The `aioredis` client needed for Pub/Sub must be explicitly initialized.
+*   **`bot-manager` Redis Client (Partial)**: The `aioredis` client for Pub/Sub is initialized and working. However, the initialization for the `redis_utils.py` client (locking/mapping) appears to still be commented out, making that specific functionality inactive.
 *   **Unused Config**: `admin-api` Redis config and `transcription-collector` `REDIS_CLEANUP_THRESHOLD` are unused.
 *   **Redundant Networking**: `whispernet` is likely unnecessary.
 *   **Outdated Bot Code**: `transcript-adapter.js` in `vexa-bot` seems unused.
-*   **WhisperLive Replicas**: Using 3 replicas with a single specified GPU (`device_ids: ['3']`) will likely lead to resource contention or errors. It should probably be set to 1 replica if only one GPU is intended.
+*   **WhisperLive Replicas**: Using >1 replica with a single specified GPU will likely lead to resource contention or errors. (Currently set to 1).
 
 ## Future Findings
 
 *(This section can be updated as more details about the system are discovered)* 
+
+
+
+
+
+## 
+docker build -t vexa-bot:latest -f services/vexa-bot/core/Dockerfile services/vexa-bot/core

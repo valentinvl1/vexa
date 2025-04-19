@@ -10,7 +10,7 @@ Okay, assuming you have successfully stashed the recent changes and reverted the
 
 **Prerequisites & Notes:**
 *   **`whisperlive` Confirmation:** Research confirms `whisperlive` accepts `language`/`task`/`uid`/etc. via an initial JSON message sent over the WebSocket upon connection. No changes are needed in `whisperlive` for Phase 1.
-*   **`bot-manager` Redis Client:** The `aioredis` client needed for publishing commands in Phase 3/4 must be initialized (e.g., during startup) in `services/bot-manager/main.py`, as the existing general Redis init is commented out.
+*   **`bot-manager` Redis Client:** The `aioredis` client needed for publishing commands in Phase 3/4 must be initialized (e.g., during startup) in `services/bot-manager/main.py`, as the existing general Redis init is commented out. **[DONE in Phase 3]**
 *   **Unique ID:** The `connectionId` generated in `docker_utils.py` and passed via `BOT_CONFIG` to `vexa-bot` will be used for the Pub/Sub channel (`bot_commands:{connectionId}`).
 *   **`vexa-bot` Network:** The current `DOCKER_NETWORK=vexa_vexa_default` setting is confirmed to be working. No change is needed.
 
@@ -39,54 +39,41 @@ Okay, assuming you have successfully stashed the recent changes and reverted the
     *   `Test 1.3:` Call `POST /bots` *with* `language: "es"` and `task: "translate"`. Check `vexa-bot` logs: verify the initial WS config message sends `language: "es"` and `task: "translate"`. Note the `connectionId`.
     *   `Test 1.4:` Stop the second bot (`DELETE /bots/...`).
 
-**Phase 2: `vexa-bot` Redis Client & Command Listener Setup**
+**Phase 2: `vexa-bot` Redis Client & Command Listener Setup - ✅ COMPLETE**
 
 *   **Goal:** Enable `vexa-bot` to connect to Redis and listen for commands on its unique channel.
+*   **Status:** This was implemented as part of Phase 3.
 *   **Steps:**
-    1.  **(Vexa Bot Dependency):** Add `redis` (recommended Node.js client) to `dependencies` in `services/vexa-bot/core/package.json`.
-    2.  **(Vexa Bot Redis Logic):** Modify `services/vexa-bot/core/src/index.ts`:
-        *   In the main execution block (after parsing `botConfig` which now contains `redisUrl` and `connectionId` stored in module vars):
-            *   Import the `redis` library.
-            *   Create a Redis client instance (`subscriber`) using the module-level `redisUrl`. Handle connection errors (`subscriber.on('error', ...)`). Connect (`await subscriber.connect()`).
-            *   Define the subscription channel using the module-level `currentConnectionId`: `const commandChannel = \`bot_commands:${currentConnectionId}\`;`.
-            *   Define a basic `messageHandler` function that simply logs the received channel and message (`log(\`Received command on ${channel}: ${message}\`);`).
-            *   Use the subscriber client to subscribe to `commandChannel`, registering the `messageHandler`: `await subscriber.subscribe(commandChannel, messageHandler);`. Handle subscription errors.
-            *   Log success/failure of connection and subscription.
-            *   *Important:* Ensure the Redis connection and subscription happen *after* the browser is launched but *before* the main `runBotLogic` might block indefinitely or exit. It needs to run concurrently. Consider wrapping the subscription logic in an `async` IIFE or similar pattern if needed.
-*   **Testing (After Rebuilding `vexa-bot`):**
-    *   `Test 2.1:` Start a bot using `POST /bots`. Note the `connectionId` from logs. Verify logs show successful Redis connection and subscription.
-    *   `Test 2.2:` Connect to Redis (`docker exec -it {redis_container_name} redis-cli`).
-    *   `Test 2.3:` Publish a test message: `PUBLISH bot_commands:{the_connection_id} "{\"action\":\"ping\"}"`.
-    *   `Test 2.4:` Check the `vexa-bot` container logs. Verify the "Received command..." log message appears.
-    *   `Test 2.5:` Stop the bot.
+    1.  **(Vexa Bot Dependency):** Added `redis` to `package.json`. **[DONE]**
+    2.  **(Vexa Bot Redis Logic):** Modified `services/vexa-bot/core/src/index.ts`: **[DONE]**
+        *   Imported `redis` library.
+        *   Created Redis client instance (`subscriber`).
+        *   Defined subscription channel `bot_commands:{currentConnectionId}`.
+        *   Defined `handleRedisMessage` function (initially just logging, now expanded in Phase 3).
+        *   Subscribed to channel using `subscriber.subscribe`.
+*   **Testing:** Initial connection/subscription verified. Full command handling tested in Phase 3.
 
-**Phase 3: Implement Runtime Reconfiguration (Language/Task via Redis)**
+**Phase 3: Implement Runtime Reconfiguration (Language/Task via Redis) - ✅ COMPLETE & VERIFIED**
 
 *   **Goal:** Change `language`/`task` via `PUT /bots/.../config`, triggering a WebSocket reconnect in the bot using the new parameters.
+*   **Session Handling Clarification:** To send the `reconfigure` command to the correct *running* bot instance, `bot-manager` **must** identify the *earliest* `session_uid` (the original `connectionId`) associated with the active meeting (from the `MeetingSession` table). It uses this `session_uid` to publish the command to the correct Redis channel (`bot_commands:{original_session_uid}`). The running `vexa-bot` instance receives this command, signals its browser context, closes the existing WebSocket connection, and then initiates a **new WebSocket connection** (by re-running its `setupWebSocket` logic which executes `new WebSocket(...)`) to WhisperLive using the updated configuration parameters (`language`, `task`). Crucially, for this new connection, `vexa-bot` **generates a new, unique session identifier (`uid`)** to distinguish this reconfigured session. This new `uid` is sent in the initial WebSocket message. Downstream processing (e.g., by `transcription-collector` processing the `session_start` event from `whisperlive`) **results in a new `MeetingSession` record** being created in the database for this new `uid`.
 *   **Steps:**
-    1.  **(Vexa Bot Reconnect Logic):** Ensure the WebSocket setup logic (e.g., `setupWebSocket` in `google.ts`) is robust and callable multiple times. It must use the *current* values of the module-level `currentLanguage` and `currentTask` variables when sending the initial config message. Add a function like `triggerWsReconnect()` in `index.ts` that safely closes the existing socket and calls `setupWebSocket()`.
-    2.  **(Vexa Bot Reconfigure Handler):** Modify `services/vexa-bot/core/src/index.ts` -> Redis `messageHandler`:
-        *   Parse the incoming message as JSON.
-        *   If `message.action === "reconfigure"`:
-            *   Log the request.
-            *   Update `currentLanguage` and/or `currentTask` module-level variables based on the message payload.
-            *   Call `triggerWsReconnect()`.
-    3.  **(Bot Manager API):** Modify `services/bot-manager/main.py`:
-        *   Add the `PUT /bots/{platform}/{native_meeting_id}/config` endpoint. Define request body schema for optional `language`/`task`.
-        *   Implement endpoint logic: Authenticate user, find active meeting, query `MeetingSession` table for the latest `session_uid` (connectionId) associated with `meeting.id`. Raise 404 if meeting/session not found or meeting not active.
-        *   Construct command payload: `{"action": "reconfigure", "uid": session_uid, "language": "...", "task": "..."}`.
-        *   Get the initialized `aioredis` client.
-        *   Publish payload to Redis channel `bot_commands:{session_uid}`.
-        *   Return `202 Accepted`.
-    4.  **(Bot Manager Redis Client):** Ensure `aioredis` client is initialized (see Prerequisites) and used for publishing.
-*   **Testing (After Rebuilding `bot-manager` & `vexa-bot`):**
-    *   `Test 3.1:` Start bot with default language (e.g., `en`). Verify initial WS config in logs.
-    *   `Test 3.2:` Call `PUT .../config` with `language: "fr"`. Verify `202 Accepted`.
-    *   `Test 3.3:` Check `vexa-bot` logs: Verify "reconfigure" command received, WebSocket closed/reconnected, *new* initial WS config message sent with `language: "fr"`.
-    *   `Test 3.4:` (Ideal) Verify transcription output language actually changes.
-    *   `Test 3.5:` Stop the bot.
+    1.  **(Bot Manager: Redis Client Init):** Modified `services/bot-manager/main.py`: Initialized `aioredis` client in `startup_event`, added global variable, added closing logic in `shutdown_event`. **[DONE]**
+    2.  **(Bot Manager: API Endpoint):** Modified `services/bot-manager/main.py`: Added `MeetingConfigUpdate` Pydantic model, added `PUT /bots/{platform}/{native_meeting_id}/config` endpoint, implemented logic to find the *most recent* active meeting and its *earliest* session UID, construct payload, and publish via Redis client. **[DONE]**
+    3.  **(API Gateway: Routing):** Modified `services/api-gateway/main.py`: Added route definition for `PUT /bots/{platform}/{native_meeting_id}/config` to forward requests to `bot-manager`. **[DONE]**
+    4.  **(Vexa Bot: Browser Reconfig):** Modified `services/vexa-bot/core/src/platforms/google.ts` (inside `page.evaluate`): Added browser-scope state variables (`currentWsLanguage`, `currentWsTask`), added UUID generation, modified WS `onopen` payload to use the new UUID and current language/task, exposed `window.triggerWebSocketReconfigure` function to update browser state and close socket. **[DONE]**
+    5.  **(Vexa Bot: Node Handler):** Modified `services/vexa-bot/core/src/index.ts`: Made `handleRedisMessage` async, added `page` parameter, implemented `reconfigure` action handling to update Node state and call `page.evaluate` to trigger the browser function. Updated `redisSubscriber.subscribe` call to pass `page` and added debug logging. **[DONE]**
+    6.  **(Vexa Bot: Build Fix):** Resolved `docker build` context issue for `entrypoint.sh`. **[DONE]**
+*   **Testing:**
+    *   Verified `bot-manager` publishes `reconfigure` command to the correct Redis channel (`bot_commands:{original_connectionId}`).
+    *   Verified `vexa-bot` receives command via Redis and logs receipt.
+    *   Verified `vexa-bot` calls browser function, closes WebSocket, and reconnects using new parameters (language/task).
+    *   Verified each WebSocket reconnection generates and uses a **new unique session ID (UUID)** in the initial config message.
+    *   Verified `transcription-collector` processes the `session_start` event for each new connection UID.
+    *   Verified a **new `MeetingSession` row** is created in the database for each unique session UID associated with the meeting.
+    *   Verified multiple sequential reconfigurations work correctly.
 
-**Phase 4: Implement Graceful Leave via Redis & Delayed Stop**
+**Phase 4: Implement Graceful Leave via Redis & Delayed Stop - ⏳ TO DO**
 
 *   **Goal:** Trigger graceful leave in `vexa-bot` via Redis before `bot-manager` forcefully stops the container.
 *   **Steps:**
@@ -115,7 +102,7 @@ Okay, assuming you have successfully stashed the recent changes and reverted the
     *   `Test 4.3:` Check `vexa-bot` logs: Verify "leave" command received, button clicks attempted/logged, browser closed, process exited. Verify container disappears soon after (much less than 30s).
     *   `Test 4.4:` (Fallback Test) Temporarily modify `performGracefulLeave` to *not* call `process.exit(0)`. Rebuild/restart bot. Start bot. Call `DELETE /bots/...`. Verify bot logs show leave attempt but process doesn't exit. Verify container is forcefully stopped by `bot-manager`'s delayed task after ~30 seconds (check `bot-manager` logs for the delayed stop attempt). Stop the bot properly after test.
 
-**Phase 5: (Optional but Recommended) Add Signal Handling Back**
+**Phase 5: (Optional but Recommended) Add Signal Handling Back - ⏳ TO DO**
 
 *   **Goal:** Make `SIGTERM`/`SIGINT` also trigger the graceful leave as a fallback.
 *   **Steps:**
@@ -132,4 +119,4 @@ Okay, assuming you have successfully stashed the recent changes and reverted the
     *   `Test 5.2:` Run `docker stop {container_id}`.
     *   `Test 5.3:` Check `vexa-bot` logs: Verify `[SIGTERM]` received, leave attempted, process exited cleanly.
 
-This chunked plan allows for incremental development and testing of each functional piece. Remember to rebuild the necessary images (`bot-manager`, `vexa-bot`) after applying the code changes for each phase.
+This chunked plan allows for incremental development and testing of each functional piece. Remember to rebuild the necessary images (`api-gateway`, `bot-manager`, `vexa-bot`) after applying the code changes for each phase.
