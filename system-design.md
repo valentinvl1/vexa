@@ -64,14 +64,16 @@ The system is composed of the following services:
     *   Prevent duplicate active bot sessions for the same user/platform/native ID.
 *   **Docker Interaction**: Uses `requests_unixsocket` (via `docker_utils.py`) to communicate with the host's Docker daemon (mounted `/var/run/docker.sock`):
     *   Starts `vexa-bot` containers (`BOT_IMAGE=vexa-bot:latest`) upon valid POST requests.
-    *   Generates an initial unique `connectionId`, passes it (and other context like `REDIS_URL`, `WHISPER_LIVE_URL`, meeting details, token) via `BOT_CONFIG` environment variable to the bot container.
+    *   Generates an initial unique `connectionId`, passes it (and other context like `REDIS_URL`, `WHISPER_LIVE_URL`, meeting details, token, initial language/task) via `BOT_CONFIG` environment variable to the bot container.
     *   Records the initial `connectionId` and start time in the `MeetingSession` table.
-    *   Stops the corresponding bot container upon valid DELETE requests (current implementation is immediate stop via background task; Phase 4 plans delayed stop).
+    *   Handles `DELETE /bots/...` requests by:
+        1.  Finding the original `connectionId` (earliest `session_uid`) for the active meeting.
+        2.  Publishing a `{"action": "leave"}` command via Redis Pub/Sub to `bot_commands:{connectionId}`.
+        3.  Scheduling a background task (`_delayed_container_stop`) to forcefully stop the container via Docker API after a delay (e.g., 30s) as a fallback.
 *   **Redis Interaction**: Uses Redis (`aioredis` client initialized in `main.py`) for:
     *   **Pub/Sub Commands:**
-        *   On `PUT /bots/.../config`, finds the most recent *active* `Meeting` record.
-        *   Finds the *earliest* `MeetingSession` record associated with that `Meeting` to retrieve the original `connectionId` (which `vexa-bot` used to subscribe).
-        *   Publishes a `reconfigure` command (`{"action": "reconfigure", "language": ..., "task": ...}`) to the Redis channel `bot_commands:{original_connectionId}`.
+        *   On `PUT /bots/.../config`, finds the most recent *active* `Meeting` record and its *earliest* `MeetingSession` (`connectionId`), then publishes a `reconfigure` command (`{"action": "reconfigure", ...}`) to the Redis channel `bot_commands:{connectionId}`.
+        *   On `DELETE /bots/...`, finds the active `Meeting` and its *earliest* `MeetingSession` (`connectionId`), then publishes a `leave` command (`{"action": "leave"}`) to the Redis channel `bot_commands:{connectionId}`.
     *   *(Celery Task Queue & Backend: Possibly used by `app/tasks/monitoring.py`, if active).*
     *   *(Distributed Locking & Mapping: `redis_utils.py` exists but its client init is commented out in `main.py`, functionality inactive).*
 *   **Dependencies**: `redis` (started), `postgres` (healthy), Docker daemon access.
@@ -101,6 +103,7 @@ The system is composed of the following services:
         *   Subscribes to the unique Redis Pub/Sub channel `bot_commands:{original_connectionId}` (using the `connectionId` received at startup).
         *   Listens for JSON command messages (`{"action": "reconfigure", ...}`, `{"action": "leave", ...}`).
         *   On `reconfigure`: Updates internal state (`language`/`task`) and triggers a WebSocket reconnection (which uses the new state and generates a new `uid`).
+        *   On `leave`: Initiates graceful shutdown (attempts to click leave buttons in meeting, closes browser, exits process).
     *   *(The file `transcript-adapter.js` exists but appears unused).*
 *   **Network**: Launched onto `vexa_vexa_default` by `bot-manager`. Needs access to `whisperlive` and `redis` (both typically on `vexa_default`).
 
@@ -243,9 +246,27 @@ Based on imports in `transcription-collector` (likely defined in `shared_models/
 11. `transcription-collector` consumes event, finds no session with `uid: uid_2`, creates new `MeetingSession` record (Session C) with `uid: uid_2`.
 12. Subsequent audio is processed by `whisperlive` using `language: "ru"`, and transcriptions are published with `uid: uid_2`.
 
+**Graceful Stop:**
+
+1.  User sends `DELETE /bots/{platform}/{native_meeting_id}`.
+2.  `api-gateway` forwards to `bot-manager`.
+3.  `bot-manager` finds the active `Meeting` record and its *earliest* `MeetingSession` (`session_uid = conn_A`).
+4.  `bot-manager` publishes `{"action": "leave"}` to Redis Pub/Sub channel `bot_commands:conn_A`.
+5.  `bot-manager` schedules a delayed background task to stop the container (`container_id` from `Meeting` record) after 30 seconds.
+6.  `bot-manager` updates `Meeting` status to `stopping` and returns `202 Accepted`.
+7.  `vexa-bot` (listening on `bot_commands:conn_A`) receives the command.
+8.  `vexa-bot` handler calls `performGracefulLeave()`:
+    *   Attempts to click leave button(s) via Playwright (`leaveGoogleMeet`).
+    *   Closes Redis connection.
+    *   Closes the browser instance.
+    *   If leave attempt was successful, exits the Node.js process (`process.exit(0)`).
+    *   If leave attempt failed, exits with error code (`process.exit(1)`).
+9.  **(If Bot Exits):** Container stops because the main process exited.
+10. **(If Bot Doesn't Exit):** After 30 seconds, `bot-manager`'s delayed task executes, forcefully stopping the container via Docker API.
+
 **Conclusion:**
 
-The data pipeline involves `vexa-bot` capturing audio and sending it via WebSocket (each connection identified by a unique UUID) to `whisperlive`. `whisperlive` transcribes and publishes results (`session_start`, `transcription`) tagged with the connection's UUID to a Redis Stream. `transcription-collector` consumes this stream, creating distinct session records and storing transcriptions. Separately, `bot-manager` uses Redis Pub/Sub (targeting the bot's original `connectionId`) to send control commands (`reconfigure`, `leave`).
+The data pipeline involves `vexa-bot` capturing audio and sending it via WebSocket (each connection identified by a unique UUID) to `whisperlive`. `whisperlive` transcribes and publishes results (`session_start`, `transcription`) tagged with the connection's UUID to a Redis Stream. `transcription-collector` consumes this stream, creating distinct session records and storing transcriptions. Separately, `bot-manager` uses Redis Pub/Sub (targeting the bot's original `connectionId`) to send control commands (`reconfigure`, `leave`). The `leave` command triggers a graceful shutdown attempt in the bot, with a delayed container stop in `bot-manager` acting as a fallback.
 
 **Key Issues Identified:**
 

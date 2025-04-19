@@ -1,6 +1,14 @@
 import { Page } from 'playwright';
 import { log, randomDelay } from '../utils';
 import { BotConfig } from '../types';
+import { v4 as uuidv4 } from 'uuid'; // Import UUID
+
+// --- ADDED: Function to generate UUID (if not already present globally) ---
+// If you have a shared utils file for this, import from there instead.
+function generateUUID() {
+    return uuidv4();
+}
+// --- --------------------------------------------------------- ---
 
 export async function handleGoogleMeet(botConfig: BotConfig, page: Page): Promise<void> {
   const leaveButton = `//button[@aria-label="Leave call"]`;
@@ -185,6 +193,10 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
         (window as any).logBot(`Original bot connection ID: ${originalConnectionId}`);
         // --- ------------------------------------------------------------------------ ---
 
+        // --- ADDED: Add secondary leave button selector for confirmation ---
+        const secondaryLeaveButtonSelector = `//button[.//span[text()='Leave meeting']] | //button[.//span[text()='Just leave the meeting']]`; // Example, adjust based on actual UI
+        // --- ----------------------------------------------------------- ---
+
         const wsUrl = "ws://whisperlive:9090";
         // (window as any).logBot(`Attempting to connect WebSocket to: ${wsUrl} with platform: ${platform}, session UID: ${sessionUid}`); // Log the correct UID
         
@@ -334,6 +346,47 @@ const startRecording = async (page: Page, botConfig: BotConfig) => {
         };
         // --- ----------------------------------------------------------- ---
         
+        // --- ADDED: Expose leave function to Node context ---
+        (window as any).performLeaveAction = async () => {
+          (window as any).logBot('Attempting to leave the meeting from browser context...');
+          try {
+              // *** FIXED: Use document.evaluate for XPath ***
+              const primaryLeaveButtonXpath = `//button[@aria-label="Leave call"]`;
+              const secondaryLeaveButtonXpath = `//button[.//span[text()='Leave meeting']] | //button[.//span[text()='Just leave the meeting']]`;
+
+              const getElementByXpath = (path: string): HTMLElement | null => {
+                  const result = document.evaluate(path, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                  return result.singleNodeValue as HTMLElement | null;
+              };
+
+              const primaryLeaveButton = getElementByXpath(primaryLeaveButtonXpath);
+              if (primaryLeaveButton) {
+                  (window as any).logBot('Clicking primary leave button...');
+                  primaryLeaveButton.click(); // No need to cast HTMLElement if getElementByXpath returns it
+                  await new Promise(resolve => setTimeout(resolve, 1000)); // Wait a bit for potential confirmation dialog
+
+                  // Try clicking secondary/confirmation button if it appears
+                  const secondaryLeaveButton = getElementByXpath(secondaryLeaveButtonXpath);
+                  if (secondaryLeaveButton) {
+                       (window as any).logBot('Clicking secondary/confirmation leave button...');
+                      secondaryLeaveButton.click();
+                      await new Promise(resolve => setTimeout(resolve, 500)); // Short wait after final click
+                  } else {
+                       (window as any).logBot('Secondary leave button not found.');
+                  }
+                  (window as any).logBot('Leave sequence completed.');
+                  return true; // Indicate leave attempt was made
+              } else {
+                  (window as any).logBot('Primary leave button not found.');
+                  return false; // Indicate leave button wasn't found
+              }
+          } catch (err: any) {
+              (window as any).logBot(`Error during leave attempt: ${err.message}`);
+              return false; // Indicate error during leave
+          }
+        };
+        // --- --------------------------------------------- ---
+        
         setupWebSocket();
 
         // FIXED: Revert to original audio processing that works with whisperlive
@@ -453,3 +506,30 @@ const recordMeeting = async (page: Page, meetingUrl: string, token: string, conn
   await startRecording(page, dummyConfig);
 };
 */
+
+// --- ADDED: Exported function to trigger leave from Node.js ---
+export async function leaveGoogleMeet(page: Page): Promise<boolean> {
+    log('[leaveGoogleMeet] Triggering leave action in browser context...');
+    if (!page || page.isClosed()) {
+        log('[leaveGoogleMeet] Page is not available or closed.');
+        return false;
+    }
+    try {
+        // Call the function exposed within the page's evaluate context
+        const result = await page.evaluate(async () => {
+            if (typeof (window as any).performLeaveAction === 'function') {
+                return await (window as any).performLeaveAction();
+            } else {
+                (window as any).logBot?.('[Node Eval Error] performLeaveAction function not found on window.');
+                console.error('[Node Eval Error] performLeaveAction function not found on window.');
+                return false;
+            }
+        });
+        log(`[leaveGoogleMeet] Browser leave action result: ${result}`);
+        return result; // Return true if leave was attempted, false otherwise
+    } catch (error: any) {
+        log(`[leaveGoogleMeet] Error calling performLeaveAction in browser: ${error.message}`);
+        return false;
+    }
+}
+// --- ------------------------------------------------------- ---

@@ -73,50 +73,23 @@ Okay, assuming you have successfully stashed the recent changes and reverted the
     *   Verified a **new `MeetingSession` row** is created in the database for each unique session UID associated with the meeting.
     *   Verified multiple sequential reconfigurations work correctly.
 
-**Phase 4: Implement Graceful Leave via Redis & Delayed Stop - ⏳ TO DO**
+**Phase 4: Implement Graceful Leave via Redis & Delayed Stop - ✅ COMPLETE (Graceful path tested)**
 
 *   **Goal:** Trigger graceful leave in `vexa-bot` via Redis before `bot-manager` forcefully stops the container.
+*   **Status:** Implemented. Graceful leave path confirmed working. Delayed stop fallback mechanism was implemented but *not explicitly tested* by the user.
 *   **Steps:**
-    1.  **(Vexa Bot Leave Function):** Implement/Refine `performGracefulLeave()` async function in `services/vexa-bot/core/src/index.ts`:
-        *   Contain Playwright logic (find/click "Leave call", wait, find/click "Just leave call", wait). Use `isConnected`/`isClosed` checks.
-        *   Attempt `await browserInstance?.close();` (use optional chaining).
-        *   Call `process.exit(0)`.
-    2.  **(Vexa Bot Leave Handler):** Modify `services/vexa-bot/core/src/index.ts` -> Redis `messageHandler`:
-        *   If `message.action === "leave"`:
-            *   Set `isShuttingDown = true`.
-            *   Log the leave command.
-            *   Call `await performGracefulLeave()`. *Handle potential errors here*.
-    3.  **(Bot Manager Delayed Stop Task):** Modify `services/bot-manager/main.py`:
-        *   Create `_delayed_container_stop(container_id: str, delay_seconds: int = 30)` async background task.
-        *   Inside: `await asyncio.sleep(delay_seconds)`, then log attempt, then call *synchronous* `stop_bot_container(container_id)`. Log result.
-    4.  **(Bot Manager Delete API):** Modify `services/bot-manager/main.py` -> `stop_bot` (`DELETE /bots/...`) endpoint:
-        *   Find active `Meeting` and latest `session_uid` (from `MeetingSession` table). Handle not found.
-        *   Construct leave payload: `json.dumps({"action": "leave", "uid": session_uid})`.
-        *   Get the initialized `aioredis` client.
-        *   Publish payload to Redis channel `bot_commands:{session_uid}`.
-        *   Schedule the *delayed* stop task: `background_tasks.add_task(_delayed_container_stop, container_id, 30)` (get `container_id` from the `Meeting` record).
-        *   Return `202 Accepted`.
-*   **Testing (After Rebuilding `bot-manager` & `vexa-bot`):**
-    *   `Test 4.1:` Start a bot.
-    *   `Test 4.2:` Call `DELETE /bots/...`. Verify `202 Accepted`.
-    *   `Test 4.3:` Check `vexa-bot` logs: Verify "leave" command received, button clicks attempted/logged, browser closed, process exited. Verify container disappears soon after (much less than 30s).
-    *   `Test 4.4:` (Fallback Test) Temporarily modify `performGracefulLeave` to *not* call `process.exit(0)`. Rebuild/restart bot. Start bot. Call `DELETE /bots/...`. Verify bot logs show leave attempt but process doesn't exit. Verify container is forcefully stopped by `bot-manager`'s delayed task after ~30 seconds (check `bot-manager` logs for the delayed stop attempt). Stop the bot properly after test.
+    1.  **(Vexa Bot Leave Function):** Implemented `leaveGoogleMeet()` in `google.ts` and `performGracefulLeave()` in `index.ts`. **[DONE]**
+    2.  **(Vexa Bot Leave Handler):** Modified Redis `handleRedisMessage` in `index.ts` to call `performGracefulLeave`. **[DONE]**
+    3.  **(Bot Manager Delayed Stop Task):** Created `_delayed_container_stop` async task in `main.py` using `asyncio.to_thread`. **[DONE]**
+    4.  **(Bot Manager Delete API):** Modified `DELETE /bots/...` endpoint in `main.py` to find session UID, publish `leave` command, schedule delayed stop, update status to `stopping`, return `202 Accepted`. **[DONE]**
+*   **Testing:**
+    *   `Test 4.1-4.3:` (Happy Path) Verified leave command sent, bot attempts leave, exits cleanly, container stops quickly. **[DONE]**
+    *   `Test 4.4:` (Fallback Test) Skipped by user.
 
-**Phase 5: (Optional but Recommended) Add Signal Handling Back - ⏳ TO DO**
+**Phase 5: (Optional but Recommended) Add Signal Handling Back - ⏭️ SKIPPED**
 
 *   **Goal:** Make `SIGTERM`/`SIGINT` also trigger the graceful leave as a fallback.
-*   **Steps:**
-    1.  **(Vexa Bot Signal Handler):** Modify `services/vexa-bot/core/src/index.ts`:
-        *   Define `gracefulShutdown(signal: string)` function.
-        *   Inside, check `isShuttingDown` flag. If already set, return.
-        *   Set `isShuttingDown = true`.
-        *   Log signal received.
-        *   Call `await performGracefulLeave()`.
-    2.  **(Vexa Bot Register Handlers):** Add `process.on('SIGTERM', ...)` and `process.on('SIGINT', ...)` to call `gracefulShutdown`.
-    3.  **(Vexa Bot Entrypoint):** Modify `services/vexa-bot/core/entrypoint.sh` to use `exec node dist/index.js` (or `exec node dist/docker.js` if that's still the entry point after compilation) so Node receives the signal.
-*   **Testing (After Rebuilding `vexa-bot`):**
-    *   `Test 5.1:` Start a bot. Get its container ID (`docker ps`).
-    *   `Test 5.2:` Run `docker stop {container_id}`.
-    *   `Test 5.3:` Check `vexa-bot` logs: Verify `[SIGTERM]` received, leave attempted, process exited cleanly.
+*   **Status:** Skipped by user request.
+*   **Steps:** *(Not Implemented)*
 
 This chunked plan allows for incremental development and testing of each functional piece. Remember to rebuild the necessary images (`api-gateway`, `bot-manager`, `vexa-bot`) after applying the code changes for each phase.
