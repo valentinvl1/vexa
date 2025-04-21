@@ -136,7 +136,7 @@ class TokenResponse(TokenBase):
         orm_mode = True
 
 class UserDetailResponse(UserResponse):
-    tokens: List[TokenResponse] = []
+    api_tokens: List[TokenResponse] = []
 
 # --- Meeting Schemas --- 
 
