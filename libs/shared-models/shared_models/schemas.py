@@ -271,3 +271,18 @@ class ErrorResponse(BaseModel):
 
 class MeetingListResponse(BaseModel):
     meetings: List[MeetingResponse] 
+
+# --- ADD Bot Status Schemas ---
+class BotStatus(BaseModel):
+    container_id: Optional[str] = None
+    container_name: Optional[str] = None
+    platform: Optional[str] = None
+    native_meeting_id: Optional[str] = None
+    status: Optional[str] = None
+    created_at: Optional[str] = None
+    labels: Optional[Dict[str, str]] = None
+    meeting_id_from_name: Optional[str] = None # Example auxiliary info
+
+class BotStatusResponse(BaseModel):
+    running_bots: List[BotStatus]
+# --- END Bot Status Schemas --- 

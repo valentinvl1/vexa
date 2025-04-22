@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 import logging
 import os
 import base64
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import redis.asyncio as aioredis
 import asyncio
 import json
@@ -16,10 +16,10 @@ import json
 # from app.tasks.monitoring import celery_app # Not used here
 
 from config import BOT_IMAGE_NAME, REDIS_URL
-from docker_utils import get_socket_session, close_docker_client, start_bot_container, stop_bot_container, _record_session_start
+from docker_utils import get_socket_session, close_docker_client, start_bot_container, stop_bot_container, _record_session_start, get_running_bots_status
 from shared_models.database import init_db, get_db, async_session_local
 from shared_models.models import User, Meeting, MeetingSession # <--- ADD MeetingSession import
-from shared_models.schemas import MeetingCreate, MeetingResponse, Platform # Import new schemas and Platform
+from shared_models.schemas import MeetingCreate, MeetingResponse, Platform, BotStatusResponse # Import new schemas and Platform
 from auth import get_user_and_token # Import the new dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -191,8 +191,8 @@ async def request_bot(
         logger.info(f"Attempting to start bot container for meeting {meeting_id} (native: {native_meeting_id})...")
         # MODIFY the call to start_bot_container:
         # Unpack both container_id and connection_id
-        container_id, connection_id = start_bot_container(
-            user_id=current_user.id,         # *** ADDED: Pass user_id ***
+        container_id, connection_id = await start_bot_container(
+            user_id=current_user.id,         # Pass user_id
             meeting_id=meeting_id,           # Internal DB ID
             meeting_url=constructed_url,     # Constructed URL (still pass it to bot if needed)
             platform=req.platform.value,     # Platform string
@@ -499,6 +499,33 @@ async def stop_bot(
     logger.info(f"Stop request for meeting {meeting.id} accepted. Leave command sent, delayed stop scheduled.")
     return {"message": "Stop request accepted and is being processed."}
 
+# --- NEW Endpoint: Get Running Bot Status --- 
+@app.get("/bots/status",
+         response_model=BotStatusResponse,
+         summary="Get status of running bot containers for the authenticated user",
+         dependencies=[Depends(get_user_and_token)])
+async def get_user_bots_status(
+    auth_data: tuple[str, User] = Depends(get_user_and_token)
+):
+    """Retrieves a list of currently running bot containers associated with the user's API key."""
+    user_token, current_user = auth_data
+    user_id = current_user.id
+    
+    logger.info(f"Fetching running bot status for user {user_id}")
+    
+    try:
+        # Call the function from docker_utils - ADD AWAIT HERE
+        running_bots_list = await get_running_bots_status(user_id)
+        # Wrap the list in the response model
+        return BotStatusResponse(running_bots=running_bots_list)
+    except Exception as e:
+        # Catch potential errors from get_running_bots_status or session issues
+        logger.error(f"Error fetching bot status for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve bot status."
+        )
+# --- END Endpoint: Get Running Bot Status --- 
 
 if __name__ == "__main__":
     uvicorn.run(

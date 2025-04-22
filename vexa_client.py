@@ -197,6 +197,17 @@ class VexaClient:
         # _request handles 202 status and returns the JSON body
         return self._request("PUT", path, api_type='user', json_data=payload)
 
+    def get_running_bots_status(self) -> List[Dict[str, Any]]:
+        """
+        Retrieves the status of running bot containers for the authenticated user.
+
+        Returns:
+            List of dictionaries, each representing the status of a running bot container.
+        """
+        response = self._request("GET", "/bots/status", api_type='user')
+        # The API returns a dict {"running_bots": [...]}, extract the list.
+        return response.get("running_bots", [])
+
     # --- Transcriptions ---
 
     def get_meetings(self) -> List[Dict[str, Any]]:

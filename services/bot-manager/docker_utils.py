@@ -4,7 +4,7 @@ import json
 import uuid
 import os
 import time
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 import asyncio
 
@@ -13,7 +13,7 @@ from shared_models.schemas import Platform
 
 # ---> ADD Missing imports for _record_session_start
 from shared_models.database import async_session_local
-from shared_models.models import MeetingSession
+from shared_models.models import MeetingSession, Meeting
 # <--- END ADD
 
 # ---> ADD Missing imports for check logic & session start
@@ -123,8 +123,9 @@ async def _record_session_start(meeting_id: int, session_uid: str):
         logger.error(f"Failed to record session start for session {session_uid}, meeting {meeting_id}: {db_err}", exc_info=True)
         # Log error but allow the main function to continue
 
-def start_bot_container(
-    user_id: int, # *** ADDED user_id parameter ***
+# Make the function async
+async def start_bot_container(
+    user_id: int,
     meeting_id: int,
     meeting_url: Optional[str],
     platform: str, # External name (e.g., google_meet)
@@ -154,7 +155,7 @@ def start_bot_container(
     # === START: Bot Limit Check ===
     try:
         # Fetch user details (including max_concurrent_bots)
-        user = TranscriptionService.get_or_create_user(user_id)
+        user = await TranscriptionService.get_or_create_user(user_id)
         if not user:
              logger.error(f"User with ID {user_id} not found...")
              raise HTTPException(status_code=404, detail=f"User {user_id} not found.")
@@ -371,3 +372,95 @@ def stop_bot_container(container_id: str) -> bool:
     except Exception as e:
         logger.error(f"Unexpected error stopping container {container_id}: {e}", exc_info=True)
         return False 
+
+# --- ADDED: Get Running Bot Status --- 
+# Make the function async
+async def get_running_bots_status(user_id: int) -> List[Dict[str, Any]]:
+    """Gets status of RUNNING bot containers for a user using labels via socket API, including DB lookup for meeting details."""
+    session = get_socket_session()
+    if not session:
+        logger.error("[Bot Status] Cannot get status, requests_unixsocket session not available.")
+        return [] 
+        
+    bots_status = []
+    running_containers = [] # Initialize
+    try:
+        # Construct filters for Docker API
+        filters = json.dumps({
+            "label": [f"vexa.user_id={user_id}"],
+            "status": ["running"]
+        })
+        
+        # Make request to list containers endpoint
+        socket_path_relative = DOCKER_HOST.split('//', 1)[1]
+        socket_path_abs = f"/{socket_path_relative}"
+        socket_path_encoded = socket_path_abs.replace("/", "%2F")
+        socket_url_base = f'http+unix://{socket_path_encoded}'
+        list_url = f'{socket_url_base}/containers/json'
+        
+        logger.debug(f"[Bot Status] Querying {list_url} with filters: {filters}")
+        response = session.get(list_url, params={"filters": filters, "all": "false"})
+        response.raise_for_status()
+        
+        running_containers = response.json()
+        logger.info(f"[Bot Status] Found {len(running_containers)} running containers for user {user_id}")
+
+    except requests_unixsocket.exceptions.RequestException as sock_err:
+        logger.error(f"[Bot Status] Failed to list containers via socket API for user {user_id}: {sock_err}", exc_info=True)
+        return [] # Return empty on error listing containers
+    except Exception as e:
+        logger.error(f"[Bot Status] Unexpected error listing containers for user {user_id}: {e}", exc_info=True)
+        return []
+        
+    # Perform DB lookups asynchronously for each container
+    async with async_session_local() as db_session:
+        for container_info in running_containers:
+            platform = None
+            native_meeting_id = None
+            meeting_id_int = None
+            
+            container_id = container_info.get('Id')
+            name = container_info.get('Names', ['N/A'])[0].lstrip('/')
+            created_at_unix = container_info.get('Created')
+            created_at = datetime.fromtimestamp(created_at_unix, timezone.utc).isoformat() if created_at_unix else None
+            status = container_info.get('Status')
+            labels = container_info.get('Labels', {})
+            
+            # Parse meeting_id from name: vexa-bot-{meeting_id}-{uuid}
+            meeting_id_from_name = "unknown"
+            try:
+                 parts = name.split('-')
+                 if len(parts) > 2 and parts[0] == 'vexa' and parts[1] == 'bot':
+                      meeting_id_from_name = parts[2]
+                      # Try converting to int for DB lookup
+                      meeting_id_int = int(meeting_id_from_name)
+            except (ValueError, IndexError, Exception) as parse_err:
+                 logger.warning(f"[Bot Status] Could not parse meeting ID from container name '{name}': {parse_err}")
+                 meeting_id_int = None # Ensure it's None if parsing fails
+            
+            # If we have a valid meeting ID, query the DB
+            if meeting_id_int is not None:
+                try:
+                    meeting = await db_session.get(Meeting, meeting_id_int)
+                    if meeting:
+                        platform = meeting.platform
+                        native_meeting_id = meeting.platform_specific_id
+                        logger.debug(f"[Bot Status] Found DB details for meeting {meeting_id_int}: platform={platform}, native_id={native_meeting_id}")
+                    else:
+                        logger.warning(f"[Bot Status] No meeting found in DB for ID {meeting_id_int} parsed from container '{name}'")
+                except Exception as db_err:
+                    logger.error(f"[Bot Status] DB error fetching meeting {meeting_id_int}: {db_err}", exc_info=True)
+            
+            bots_status.append({
+                "container_id": container_id,
+                "container_name": name,
+                "platform": platform, # Added
+                "native_meeting_id": native_meeting_id, # Added
+                "status": status,
+                "created_at": created_at,
+                "labels": labels,
+                "meeting_id_from_name": meeting_id_from_name
+            })
+            
+    return bots_status
+# --- END: Get Running Bot Status --- 
