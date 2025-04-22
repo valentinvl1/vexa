@@ -192,14 +192,15 @@ async def request_bot(
         # MODIFY the call to start_bot_container:
         # Unpack both container_id and connection_id
         container_id, connection_id = start_bot_container(
+            user_id=current_user.id,         # *** ADDED: Pass user_id ***
             meeting_id=meeting_id,           # Internal DB ID
             meeting_url=constructed_url,     # Constructed URL (still pass it to bot if needed)
             platform=req.platform.value,     # Platform string
             bot_name=req.bot_name,
-            user_token=user_token,           # *** ADDED: Pass the user's API token ***
-            native_meeting_id=native_meeting_id, # *** ADDED: Pass the native meeting ID ***
-            language=req.language,           # *** ADDED: Pass language ***
-            task=req.task                    # *** ADDED: Pass task ***
+            user_token=user_token,           # Pass the user's API token
+            native_meeting_id=native_meeting_id, # Pass the native meeting ID
+            language=req.language,           # Pass language
+            task=req.task                    # Pass task
         )
         logger.info(f"Call to start_bot_container completed. Container ID: {container_id}, Connection ID: {connection_id}") # Log both IDs
 
@@ -236,25 +237,47 @@ async def request_bot(
         logger.info(f"Successfully started bot container {container_id} for meeting {meeting_id}")
         return MeetingResponse.from_orm(new_meeting)
 
+    except HTTPException as http_exc:
+        # If the exception was already an HTTPException (like our 403 limit error), re-raise it directly.
+        logger.warning(f"HTTPException occurred during bot startup for meeting {meeting_id}: {http_exc.status_code} - {http_exc.detail}")
+        # Attempt to update status to error for specific cases if needed, or just re-raise
+        try:
+            # Fetch again in case session state is lost or object is detached
+            meeting_to_update = await db.get(Meeting, meeting_id)
+            if meeting_to_update and meeting_to_update.status != 'error': # Avoid redundant updates
+                 logger.warning(f"Updating meeting {meeting_id} status to 'error' due to HTTPException {http_exc.status_code}.")
+                 meeting_to_update.status = 'error'
+                 # Assign container ID even if update failed later, helps debugging
+                 if container_id: # If container was somehow created before error
+                     meeting_to_update.bot_container_id = container_id
+                 await db.commit()
+            elif not meeting_to_update:
+                logger.error(f"Could not find meeting {meeting_id} to update status to error after HTTPException.")
+        except Exception as db_err:
+             logger.error(f"Failed to update meeting {meeting_id} status to error after HTTPException: {db_err}")
+        raise http_exc # Re-raise the original HTTPException (e.g., the 403)
+
     except Exception as e:
+        # Catch any other unexpected errors as 500
         # Enhanced logging in the exception handler
-        logger.error(f"Exception occurred during bot startup process for meeting {meeting_id} (after DB creation): {e}", exc_info=True)
+        logger.error(f"Unexpected exception occurred during bot startup process for meeting {meeting_id} (after DB creation): {e}", exc_info=True)
         # Attempt to update status to error even if container start failed or subsequent update failed
         try:
             # Fetch again in case session state is lost or object is detached
             meeting_to_update = await db.get(Meeting, meeting_id)
             if meeting_to_update and meeting_to_update.status != 'error': # Avoid redundant updates
-                 logger.warning(f"Updating meeting {meeting_id} status to 'error' due to exception.")
+                 logger.warning(f"Updating meeting {meeting_id} status to 'error' due to unexpected exception.")
                  meeting_to_update.status = 'error'
                  # Assign container ID even if update failed later, helps debugging
                  if container_id:
                      meeting_to_update.bot_container_id = container_id
                  await db.commit()
             elif not meeting_to_update:
-                logger.error(f"Could not find meeting {meeting_id} to update status to error.")
+                logger.error(f"Could not find meeting {meeting_id} to update status to error after unexpected exception.")
         except Exception as db_err:
-             logger.error(f"Failed to update meeting {meeting_id} status to error after bot startup exception: {db_err}")
+             logger.error(f"Failed to update meeting {meeting_id} status to error after unexpected exception: {db_err}")
 
+        # Raise a generic 500 error for unexpected issues
         # Re-raise HTTPException to send appropriate response to client
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

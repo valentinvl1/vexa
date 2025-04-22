@@ -11,7 +11,7 @@ from typing import List # Import List for response model
 
 # Import shared models and schemas
 from shared_models.models import User, APIToken, Base # Import Base for init_db
-from shared_models.schemas import UserCreate, UserResponse, TokenResponse, UserDetailResponse # Import required schemas
+from shared_models.schemas import UserCreate, UserResponse, TokenResponse, UserDetailResponse, UserBase, UserUpdate # Import UserBase for update and UserUpdate schema
 
 # Database utilities (needs to be created)
 from shared_models.database import get_db, init_db # New import
@@ -125,6 +125,54 @@ async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
         
     # Return the user object. Pydantic will handle serialization using UserDetailResponse.
     return user
+
+@router.patch("/users/{user_id}",
+             response_model=UserResponse,
+             summary="Update user details",
+             description="Update user's name, image URL, or max concurrent bots.")
+async def update_user(user_id: int, user_update: UserUpdate, db: AsyncSession = Depends(get_db)):
+    """
+    Updates specific fields of a user.
+    Only provide the fields you want to change in the request body.
+    Requires admin privileges.
+    """
+    # Fetch the user to update
+    result = await db.execute(select(User).where(User.id == user_id))
+    db_user = result.scalars().first()
+
+    if not db_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    # Get the update data, excluding unset fields to only update provided values
+    update_data = user_update.dict(exclude_unset=True)
+
+    # Prevent changing email via this endpoint (if desired)
+    if 'email' in update_data and update_data['email'] != db_user.email:
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot change user email via this endpoint.")
+    elif 'email' in update_data:
+         del update_data['email'] # Don't attempt to update email to the same value
+
+    # Update the user object attributes
+    updated = False
+    for key, value in update_data.items():
+        if hasattr(db_user, key) and getattr(db_user, key) != value:
+            setattr(db_user, key, value)
+            updated = True
+
+    # If any changes were made, commit them
+    if updated:
+        try:
+            await db.commit()
+            await db.refresh(db_user)
+            logger.info(f"Admin updated user ID: {user_id}")
+        except Exception as e: # Catch potential DB errors (e.g., constraints)
+            await db.rollback()
+            logger.error(f"Error updating user {user_id}: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update user.")
+    else:
+        logger.info(f"Admin attempted update for user ID: {user_id}, but no changes detected.")
+
+    return UserResponse.from_orm(db_user)
 
 @router.post("/users/{user_id}/tokens", 
              response_model=TokenResponse,

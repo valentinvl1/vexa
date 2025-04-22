@@ -13,18 +13,8 @@ if libs_dir not in sys.path:
     sys.path.insert(0, libs_dir)
 # --------------------
 
-try:
-    # Ensure models are implicitly loaded by importing Base or the database module
-    from shared_models.database import recreate_db, logger as db_logger, Base 
-    # Optionally import models if Base needs population from here, though database.py should handle it
-    # from shared_models import models 
-except ImportError as e:
-    print(f"\nError: Could not import shared_models. Ensure the script is run in an environment \n" \
-          f"where 'shared_models' is installed or the 'libs' directory is correctly added to PYTHONPATH. \n" \
-          f"Attempted path: {libs_dir}\n" \
-          f"Current sys.path: {sys.path}\n" \
-          f"Details: {e}\n")
-    sys.exit(1)
+from shared_models.database import recreate_db, logger as db_logger, Base 
+
 
 # Configure logging to see the warnings/errors from recreate_db
 # Set level to INFO to capture all messages from the function

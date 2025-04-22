@@ -110,6 +110,7 @@ class UserBase(BaseModel): # Base for common user fields
     email: EmailStr
     name: Optional[str] = None
     image_url: Optional[str] = None
+    max_concurrent_bots: Optional[int] = Field(None, description="Maximum number of concurrent bots allowed for the user")
 
 class UserCreate(UserBase):
     pass
@@ -117,6 +118,7 @@ class UserCreate(UserBase):
 class UserResponse(UserBase):
     id: int
     created_at: datetime
+    max_concurrent_bots: int = Field(..., description="Maximum number of concurrent bots allowed for the user")
 
     class Config:
         orm_mode = True
@@ -137,6 +139,14 @@ class TokenResponse(TokenBase):
 
 class UserDetailResponse(UserResponse):
     api_tokens: List[TokenResponse] = []
+
+# --- ADD UserUpdate Schema for PATCH ---
+class UserUpdate(BaseModel):
+    email: Optional[EmailStr] = None # Make all fields optional for PATCH
+    name: Optional[str] = None
+    image_url: Optional[str] = None
+    max_concurrent_bots: Optional[int] = Field(None, description="Maximum number of concurrent bots allowed for the user")
+# --- END UserUpdate Schema ---
 
 # --- Meeting Schemas --- 
 
