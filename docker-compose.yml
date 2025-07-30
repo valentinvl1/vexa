@@ -78,48 +78,20 @@ services:
       - vexa_default
     restart: unless-stopped
 
-  whisperlive:
-    profiles: ["gpu"]
+  gladia-transcription:
     build:
       context: .
-      dockerfile: services/WhisperLive/Dockerfile.project
-    volumes:
-      - ./hub:/root/.cache/huggingface/hub
-      - ./services/WhisperLive/models:/app/models
+      dockerfile: services/gladia-transcription-service/Dockerfile
     environment:
-      # Use Redis Stream URL instead of WebSocket URL
-      - REDIS_STREAM_URL=redis://redis:6379/0/transcription_segments
-      # Keep the old URL for backward compatibility
-      - TRANSCRIPTION_COLLECTOR_URL=redis://redis:6379/0/transcription_segments
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_DB=0
-      - REDIS_STREAM_NAME=transcription_segments
-      - LANGUAGE_DETECTION_SEGMENTS=${LANGUAGE_DETECTION_SEGMENTS}
-      - VAD_FILTER_THRESHOLD=${VAD_FILTER_THRESHOLD}
-      - DEVICE_TYPE=${DEVICE_TYPE}
-    entrypoint: /bin/sh
-    command:
-      - "-c"
-      - |
-        if [ "$${DEVICE_TYPE}" = "cuda" ]; then
-          echo 'INFO: DEVICE_TYPE is cuda, starting WhisperLive GPU service.' &&
-          exec python3 /app/run_server.py --port 9090 --backend faster_whisper -fw /root/.cache/huggingface/hub/models--Systran--faster-whisper-medium/snapshots/08e178d48790749d25932bbc082711ddcfdfbc4f;
-        else
-          echo "INFO: DEVICE_TYPE is not cuda (it is '$${DEVICE_TYPE}'), WhisperLive GPU service will not start. Sleeping indefinitely." &&
-          sleep infinity;
-        fi
+      - REDIS_STREAM_URL=redis://redis:6379/0
+      - REDIS_STREAM_KEY=transcription_segments
+      - REDIS_SPEAKER_EVENTS_RELATIVE_STREAM_KEY=speaker_events_relative
+      - GLADIA_API_KEY=${GLADIA_API_KEY}
+      - SILENCE_THRESHOLD_SECONDS=60
+      - VAD_THRESHOLD=0.5
     expose:
       - "9090" #use for transcription web socket
       - "9091" #use for health check
-    deploy:
-      replicas: 1 # Sets to 1 to avoid GPU contention
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["3"] # Ensure this is configurable or correct for your setup
-              capabilities: [gpu]
     init: true
     depends_on:
       transcription-collector:
@@ -136,81 +108,14 @@ services:
     # Add Traefik labels for service discovery
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.whisperlive-router.rule=Host(`whisperlive.internal`) && PathPrefix(`/ws`)"
-      - "traefik.http.routers.whisperlive-router.entrypoints=web"
-      - "traefik.http.services.whisperlive-service.loadbalancer.server.port=9090"
-      - "traefik.http.middlewares.whisperlive-ws-headers.headers.customrequestheaders.Connection=upgrade"
-      - "traefik.http.middlewares.whisperlive-ws-headers.headers.customrequestheaders.Upgrade=websocket"
-      - "traefik.http.routers.whisperlive-router.middlewares=whisperlive-ws-headers"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.path=/health"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.port=9091"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.scheme=http"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.interval=2s"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.timeout=1s"
+      - "traefik.http.routers.gladia-transcription-router.rule=Host(`whisperlive.internal`) && PathPrefix(`/ws`)"
+      - "traefik.http.routers.gladia-transcription-router.entrypoints=web"
+      - "traefik.http.services.gladia-transcription-service.loadbalancer.server.port=9090"
+      - "traefik.http.middlewares.gladia-transcription-ws-headers.headers.customrequestheaders.Connection=upgrade"
+      - "traefik.http.middlewares.gladia-transcription-ws-headers.headers.customrequestheaders.Upgrade=websocket"
+      - "traefik.http.routers.gladia-transcription-router.middlewares=gladia-transcription-ws-headers"
 
-  # CPU version of WhisperLive for users without GPU
-  whisperlive-cpu:
-    profiles: ["cpu"]
-    build:
-      context: .
-      dockerfile: services/WhisperLive/Dockerfile.cpu
-    volumes:
-      - ./hub:/root/.cache/huggingface/hub
-      - ./services/WhisperLive/models:/app/models
-    environment:
-      - REDIS_STREAM_URL=redis://redis:6379/0/transcription_segments
-      - TRANSCRIPTION_COLLECTOR_URL=redis://redis:6379/0/transcription_segments
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_DB=0
-      - REDIS_STREAM_NAME=transcription_segments
-      - LANGUAGE_DETECTION_SEGMENTS=${LANGUAGE_DETECTION_SEGMENTS}
-      - VAD_FILTER_THRESHOLD=${VAD_FILTER_THRESHOLD}
-      - DEVICE_TYPE=cpu
-    entrypoint: /bin/sh
-    deploy:
-      replicas: 2
-    command:
-      - "-c"
-      - |
-        if [ "$${DEVICE_TYPE}" = "cpu" ]; then
-          echo 'INFO: DEVICE_TYPE is cpu, starting WhisperLive CPU service.' &&
-          exec python3 /app/run_server.py --port 9090 --backend faster_whisper -fw /root/.cache/huggingface/hub/models--Systran--faster-whisper-tiny/snapshots/d90ca5fe260221311c53c58e660288d3deb8d356;
-        else
-          echo "INFO: DEVICE_TYPE is not cpu (it is '$${DEVICE_TYPE}'), WhisperLive CPU service will not start. Sleeping indefinitely." &&
-          sleep infinity;
-        fi
-    expose:
-      - "9090" #use for transcription web socket
-      - "9091" #use for health check
-    init: true
-    depends_on:
-      transcription-collector:
-        condition: service_started
-    networks:
-      - vexa_default
-      - whispernet
-    # Don't auto-start CPU version, users can manually start it
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    # Add Traefik labels for service discovery
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.whisperlive-router.rule=Host(`whisperlive.internal`) && PathPrefix(`/ws`)"
-      - "traefik.http.routers.whisperlive-router.entrypoints=web"
-      - "traefik.http.services.whisperlive-service.loadbalancer.server.port=9090"
-      - "traefik.http.middlewares.whisperlive-ws-headers.headers.customrequestheaders.Connection=upgrade"
-      - "traefik.http.middlewares.whisperlive-ws-headers.headers.customrequestheaders.Upgrade=websocket"
-      - "traefik.http.routers.whisperlive-router.middlewares=whisperlive-ws-headers"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.path=/health"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.port=9091"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.scheme=http"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.interval=2s"
-      - "traefik.http.services.whisperlive-service.loadbalancer.healthcheck.timeout=1s"
+
 
   # Replace nginx load-balancer with Traefik
   traefik:
