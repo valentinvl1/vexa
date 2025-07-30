@@ -1,24 +1,30 @@
-FROM python:3.11-slim
+# Base Python image
+FROM python:3.10-slim
 
+# Set working directory
 WORKDIR /app
 
-# Installation des dépendances système
-RUN apt-get update && apt-get install -y \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+# Install shared library first
+COPY ./libs/shared-models /app/libs/shared-models
+# Explicitly install the shared library from its location within the container
+RUN pip install --no-cache-dir /app/libs/shared-models
 
-# Copie des fichiers de dépendances
-COPY requirements.txt .
+COPY alembic.ini /app/alembic.ini
+COPY ./libs/shared-models/alembic /app/alembic
 
-# Installation des dépendances Python
+# Copy application code and requirements
+# COPY ./services/transcription-collector/requirements.txt /app/ # Replaced by the line below
+# COPY ./services/transcription-collector/*.py /app/ # Replaced by the line below
+COPY ./services/transcription-collector/ /app/
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copie du code source
-COPY main.py .
+# Expose port (internal only, but good practice)
+# WebSocket
+EXPOSE 9090
+# Health check
+EXPOSE 9091
 
-# Exposition des ports
-EXPOSE 9090  # WebSocket
-EXPOSE 9091  # Health check
-
-# Commande de démarrage
-CMD ["python", "main.py"] 
+# Command to run the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"] 
