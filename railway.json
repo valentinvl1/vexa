@@ -5,7 +5,8 @@
     "dockerfilePath": "services/transcription-collector/Dockerfile"
   },
   "deploy": {
-    "startCommand": "uvicorn main:app --host 0.0.0.0 --port 8000",
+    // On écoute désormais sur le port dynamique fourni par Railway
+    "startCommand": "uvicorn main:app --host 0.0.0.0 --port $PORT",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",
