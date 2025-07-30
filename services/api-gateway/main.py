@@ -157,13 +157,15 @@ async def forward_request(client: httpx.AsyncClient, method: str, url: str, requ
         else:
             print(f"DEBUG: No x-admin-api-key header found in request")
     else:
-        # Forward client API key for bot-manager and transcription-collector
-        client_key = request.headers.get("x-api-key")
-        if client_key:
-            headers["x-api-key"] = client_key
-            print(f"DEBUG: Forwarding x-api-key header: {client_key[:5]}...")
-        else:
-            print(f"DEBUG: No x-api-key header found in request. Headers: {dict(request.headers)}")
+    client_key = request.headers.get("x-api-key")
+    if not client_key:
+        raise HTTPException(status_code=401, detail="Missing API token")
+    if client_key not in ALLOWED_API_KEYS:
+        raise HTTPException(status_code=403, detail="Invalid API token")
+    
+    headers["x-api-key"] = client_key
+    print(f"DEBUG: Valid X-API-Key received: {client_key[:5]}...")
+
     
     # Debug logging for forwarded headers
     print(f"DEBUG: Forwarded headers: {headers}")
