@@ -16,6 +16,10 @@ from websockets.exceptions import ConnectionClosed
 import http.server
 import socketserver
 
+# Ajout FastAPI pour health check
+from fastapi import FastAPI
+import uvicorn
+
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gladia_transcription")
@@ -429,60 +433,6 @@ class GladiaTranscriptionClient:
         """Nettoie les ressources"""
         self.stop_transcription()
 
-class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
-    """Handler pour les vérifications de santé"""
-    
-    def __init__(self, *args, gladia_server_ref=None, **kwargs):
-        self.gladia_server = gladia_server_ref
-        super().__init__(*args, **kwargs)
-    
-    def do_GET(self):
-        if self.path == '/health':
-            # Vérifier la santé du serveur WebSocket
-            websocket_healthy = self.gladia_server.is_healthy if self.gladia_server else False
-            
-            # Vérifier la santé Redis
-            redis_healthy = False
-            redis_ping_error = "Collector client not initialized"
-            if self.gladia_server and self.gladia_server.collector_client:
-                if self.gladia_server.collector_client.redis_client:
-                    try:
-                        with self.gladia_server.collector_client.connection_lock:
-                            if self.gladia_server.collector_client.redis_client:
-                                self.gladia_server.collector_client.redis_client.ping()
-                                redis_healthy = True
-                                redis_ping_error = "None"
-                    except Exception as e:
-                        redis_ping_error = str(e)
-                        logger.warning(f"Health check: Redis ping failed: {e}")
-            
-            if websocket_healthy and redis_healthy:
-                self.send_response(200)
-                self.send_header('Content-type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(b'OK')
-            else:
-                unhealthy_reasons = []
-                if not websocket_healthy:
-                    unhealthy_reasons.append("WebSocket server not ready")
-                if not redis_healthy:
-                    unhealthy_reasons.append(f"Redis connection unhealthy (ping error: {redis_ping_error})")
-                
-                logger.warning(f"Health check failed: {', '.join(unhealthy_reasons)}")
-                self.send_response(503)
-                self.send_header('Content-type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(f"Service Unavailable: {', '.join(unhealthy_reasons)}".encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'Not Found')
-    
-    def log_message(self, format, *args):
-        # Désactiver les logs de requêtes HTTP pour réduire le bruit
-        pass
-
 class GladiaTranscriptionServer:
     """Serveur de transcription utilisant l'API Gladia"""
     
@@ -569,55 +519,25 @@ class GladiaTranscriptionServer:
             websocket.send(json.dumps({'type': 'pong'}))
         else:
             logger.warning(f"Type de message de contrôle inconnu: {msg_type}")
-    
-    def start_health_check_server(self, host="0.0.0.0", port=9091):
-        """Démarre le serveur de vérification de santé"""
-        def run_health_server():
-            try:
-                with socketserver.TCPServer((host, port), 
-                    lambda *args, **kwargs: HealthCheckHandler(*args, gladia_server_ref=self, **kwargs)) as httpd:
-                    logger.info(f"Serveur de santé démarré sur {host}:{port}")
-                    self.health_server = httpd
-                    httpd.serve_forever()
-            except Exception as e:
-                logger.error(f"Erreur lors du démarrage du serveur de santé: {e}")
-        
-        health_thread = threading.Thread(target=run_health_server, daemon=True)
-        health_thread.start()
-        logger.info("Thread du serveur de santé démarré")
-    
-    def stop_health_check_server(self):
-        """Arrête le serveur de vérification de santé"""
-        if self.health_server:
-            try:
-                self.health_server.shutdown()
-                logger.info("Serveur de santé arrêté")
-            except Exception as e:
-                logger.error(f"Erreur lors de l'arrêt du serveur de santé: {e}")
-    
-    def run(self, host="0.0.0.0", port=9090):
-        """Démarre le serveur WebSocket"""
-        self.is_healthy = True
-        logger.info(f"Démarrage du serveur Gladia Transcription sur {host}:{port}")
-        
-        # Démarrer le serveur de santé
-        self.start_health_check_server()
-        
-        try:
-            with serve(self.handle_new_connection, host, port) as server:
-                logger.info(f"Serveur démarré avec succès sur {host}:{port}")
-                server.serve_forever()
-        except Exception as e:
-            logger.error(f"Erreur lors du démarrage du serveur: {e}")
-        finally:
-            self.is_healthy = False
-            self.stop_health_check_server()
-            self.collector_client.disconnect()
+
+# FastAPI app pour /health
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return "OK"
 
 if __name__ == "__main__":
     if not GLADIA_API_KEY:
         logger.error("GLADIA_API_KEY non définie dans les variables d'environnement")
         exit(1)
-    
+
+    # Lancer FastAPI (pour /health) dans un thread séparé
+    def run_api():
+        uvicorn.run("main:app", host="0.0.0.0", port=9090, log_level="info")
+    import threading
+    threading.Thread(target=run_api, daemon=True).start()
+
+    # Lancer le serveur WebSocket (sur le même port ou un autre si besoin)
     server = GladiaTranscriptionServer()
     server.run() 
