@@ -1,5 +1,10 @@
 import os
 
+# Redis connection details
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_URL = os.environ.get("REDIS_URL", f"redis://{REDIS_HOST}:{REDIS_PORT}")
+
 # Configuration for Redis Stream consumer
 REDIS_STREAM_NAME = os.environ.get("REDIS_STREAM_NAME", "transcription_segments")
 REDIS_CONSUMER_GROUP = os.environ.get("REDIS_CONSUMER_GROUP", "collector_group")
@@ -12,8 +17,8 @@ PENDING_MSG_TIMEOUT_MS = 60000  # Milliseconds: Timeout after which pending mess
 # Configuration for Speaker Events Stream (NEW)
 REDIS_SPEAKER_EVENTS_STREAM_NAME = os.environ.get("REDIS_SPEAKER_EVENTS_STREAM_NAME", "speaker_events_relative")
 REDIS_SPEAKER_EVENTS_CONSUMER_GROUP = os.environ.get("REDIS_SPEAKER_EVENTS_CONSUMER_GROUP", "collector_speaker_group")
-REDIS_SPEAKER_EVENT_KEY_PREFIX = os.environ.get("REDIS_SPEAKER_EVENT_KEY_PREFIX", "speaker_events") # For sorted sets
-REDIS_SPEAKER_EVENT_TTL = int(os.environ.get("REDIS_SPEAKER_EVENT_TTL", "86400")) # 24 hours default TTL for speaker events sorted sets
+REDIS_SPEAKER_EVENT_KEY_PREFIX = os.environ.get("REDIS_SPEAKER_EVENT_KEY_PREFIX", "speaker_events")  # For sorted sets
+REDIS_SPEAKER_EVENT_TTL = int(os.environ.get("REDIS_SPEAKER_EVENT_TTL", "86400"))  # 24 hours default TTL for speaker events sorted sets
 
 # Configuration for background processing
 BACKGROUND_TASK_INTERVAL = int(os.environ.get("BACKGROUND_TASK_INTERVAL", "10"))  # seconds
@@ -25,7 +30,3 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # Security - API Key auth
 API_KEY_NAME = "X-API-Key"
-
-# Redis connection details
-REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379")) 
