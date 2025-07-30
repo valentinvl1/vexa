@@ -6,14 +6,14 @@ build-backend = "setuptools.build_meta"
 name = "shared-models"
 version = "0.1.0"
 authors = [
-  { name="Your Name", email="you@example.com" }, # TODO: Update author details
+  { name="Vexa Team", email="support@vexa.ai" },
 ]
 description = "Shared database models and schemas for the Vexa project"
 readme = "README.md"
 requires-python = ">=3.9" # Adjust Python version as needed
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License", # TODO: Choose appropriate license
+    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -27,8 +27,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/your-repo/vexa" # TODO: Update repo URL
-"Bug Tracker" = "https://github.com/your-repo/vexa/issues" # TODO: Update repo URL
+"Homepage" = "https://github.com/Vexa-ai/vexa"
+"Bug Tracker" = "https://github.com/Vexa-ai/vexa/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
