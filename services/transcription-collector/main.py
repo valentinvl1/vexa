@@ -12,6 +12,7 @@ from shared_models.database import get_db, init_db
 from shared_models.models import Meeting
 from filters import TranscriptionFilter
 from config import (
+    REDIS_URL,
     REDIS_STREAM_NAME,
     REDIS_CONSUMER_GROUP,
     REDIS_STREAM_READ_COUNT,
@@ -21,8 +22,6 @@ from config import (
     BACKGROUND_TASK_INTERVAL,
     IMMUTABILITY_THRESHOLD,
     LOG_LEVEL,
-    REDIS_HOST,
-    REDIS_PORT,
     REDIS_SPEAKER_EVENTS_STREAM_NAME,
     REDIS_SPEAKER_EVENTS_CONSUMER_GROUP
 )
@@ -58,13 +57,8 @@ speaker_stream_consumer_task = None
 async def startup():
     global redis_client, redis_to_pg_task, stream_consumer_task, speaker_stream_consumer_task, transcription_filter
     
-    logger.info(f"Connecting to Redis at {REDIS_HOST}:{REDIS_PORT}")
-    temp_redis_client = aioredis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=0,
-        decode_responses=True
-    )
+    logger.info(f"Connecting to Redis at {REDIS_URL}")
+    temp_redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
     await temp_redis_client.ping()
     redis_client = temp_redis_client
     app.state.redis_client = redis_client
@@ -113,14 +107,12 @@ async def startup():
     stream_consumer_task = asyncio.create_task(consume_redis_stream(redis_client))
     logger.info(f"Redis Stream consumer task started (Stream: {REDIS_STREAM_NAME}, Group: {REDIS_CONSUMER_GROUP}, Consumer: {CONSUMER_NAME})")
 
-    # Start speaker events consumer task
     speaker_stream_consumer_task = asyncio.create_task(consume_speaker_events_stream(redis_client))
     logger.info(f"Speaker Events Redis Stream consumer task started (Stream: {REDIS_SPEAKER_EVENTS_STREAM_NAME}, Group: {REDIS_SPEAKER_EVENTS_CONSUMER_GROUP}, Consumer: {CONSUMER_NAME + '-speaker'})")
 
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("Application shutting down...")
-    # Cancel background tasks
     tasks_to_cancel = [redis_to_pg_task, stream_consumer_task, speaker_stream_consumer_task]
     for i, task in enumerate(tasks_to_cancel):
         if task and not task.done():
@@ -132,7 +124,6 @@ async def shutdown():
             except Exception as e:
                 logger.error(f"Error during background task {i+1} cancellation: {e}", exc_info=True)
     
-    # Close Redis connection
     if redis_client:
         await redis_client.close()
         logger.info("Redis connection closed.")
@@ -141,4 +132,4 @@ async def shutdown():
 
 if __name__ == "__main__":
     # Removed uvicorn runner, rely on Docker CMD
-    pass 
+    pass
