@@ -13,6 +13,12 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be defined")
 
 # Instance de la base de données
+# Conversion vers format asyncpg si ce n'est pas déjà le cas
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
 database = Database(DATABASE_URL)
 
 # SQLAlchemy metadata object (à utiliser si nécessaire pour des migrations ou introspection)
