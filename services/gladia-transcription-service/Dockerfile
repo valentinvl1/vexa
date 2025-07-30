@@ -20,11 +20,8 @@ COPY ./services/transcription-collector/ /app/
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Expose port (internal only, but good practice)
-# WebSocket
+# Expose uniquement le port principal
 EXPOSE 9090
-# Health check
-EXPOSE 9091
 
 # Command to run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"] 
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9090"] 
