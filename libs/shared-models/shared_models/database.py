@@ -11,12 +11,21 @@ from .models import Base
 logger = logging.getLogger("shared_models.database")
 
 # --- Database Configuration ---
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if DATABASE_URL:
-    logger.info("Using DATABASE_URL from environment")
-    # Convert async URL to sync version for Alembic if needed
-    DATABASE_URL_SYNC = DATABASE_URL.replace("+asyncpg", "")
+# Read raw DATABASE_URL from environment
+raw_db_url = os.environ.get("DATABASE_URL")
+if raw_db_url:
+    # Ensure asyncpg driver is specified
+    if raw_db_url.startswith("postgres://"):
+        async_db_url = raw_db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif raw_db_url.startswith("postgresql://") and "+asyncpg" not in raw_db_url:
+        async_db_url = raw_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    else:
+        async_db_url = raw_db_url
+    DATABASE_URL = async_db_url
+    DATABASE_URL_SYNC = async_db_url.replace("+asyncpg", "")
+    logger.info(f"Using DATABASE_URL from environment: {DATABASE_URL}")
 else:
+    # Fallback to individual DB_* vars
     DB_HOST = os.environ.get("DB_HOST", "postgres")
     DB_PORT = os.environ.get("DB_PORT", "5432")
     DB_NAME = os.environ.get("DB_NAME", "vexa")
@@ -24,6 +33,7 @@ else:
     DB_PASSWORD = os.environ.get("DB_PASSWORD", "postgres")
     DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     DATABASE_URL_SYNC = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    logger.info(f"Constructed DATABASE_URL from DB_* vars: {DATABASE_URL}")
 
 # --- SQLAlchemy Async Engine & Session ---
 echo_debug = os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG"
