@@ -35,6 +35,11 @@ app = FastAPI(
 )
 app.include_router(api_router)
 
+# ✅ Ajouter ici l'endpoint /health
+@app.get("/health", tags=["health"])
+async def health_check():
+    return {"status": "ok"}
+
 # Configure logging
 logging.basicConfig(
     level=LOG_LEVEL,
