@@ -1,16 +1,77 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
-  "build": {
-    "builder": "DOCKERFILE",
-    "dockerfilePath": "services/transcription-collector/Dockerfile"
-  },
-  "deploy": {
-    "startCommand": "sh -c \"uvicorn main:app --host 0.0.0.0 --port $PORT\"",
-    "healthcheckPath": "/health",
-    "healthcheckTimeout": 300,
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 3
-  },
+  "services": [
+    {
+      "name": "api-gateway",
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "services/api-gateway/Dockerfile"
+      },
+      "deploy": {
+        "startCommand": "sh -c \"uvicorn main:app --host 0.0.0.0 --port $PORT\"",
+        "healthcheckPath": "/",
+        "healthcheckTimeout": 60,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 3
+      }
+    },
+    {
+      "name": "transcription-collector",
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "services/transcription-collector/Dockerfile"
+      },
+      "deploy": {
+        "startCommand": "sh -c \"uvicorn main:app --host 0.0.0.0 --port $PORT\"",
+        "healthcheckPath": "/health",
+        "healthcheckTimeout": 300,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 3
+      }
+    },
+    {
+      "name": "bot-manager",
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "services/bot-manager/Dockerfile"
+      },
+      "deploy": {
+        "startCommand": "sh -c \"uvicorn main:app --host 0.0.0.0 --port $PORT\"",
+        "healthcheckPath": "/",
+        "healthcheckTimeout": 60,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 3
+      }
+    },
+    {
+      "name": "admin-api",
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "services/admin-api/Dockerfile"
+      },
+      "deploy": {
+        "startCommand": "sh -c \"uvicorn app.main:app --host 0.0.0.0 --port $PORT\"",
+        "healthcheckPath": "/",
+        "healthcheckTimeout": 60,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 3
+      }
+    },
+    {
+      "name": "gladia-transcription-service",
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "services/gladia-transcription-service/Dockerfile"
+      },
+      "deploy": {
+        "startCommand": "sh -c \"uvicorn main:app --host 0.0.0.0 --port $PORT\"",
+        "healthcheckPath": "/health",
+        "healthcheckTimeout": 300,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 3
+      }
+    }
+  ],
   "variables": {
     "REDIS_URL": "{{REDIS_URL}}"
   },
@@ -36,6 +97,3 @@
         "VAD_THRESHOLD": "0.5",
         "LOG_LEVEL": "DEBUG"
       }
-    }
-  }
-}
