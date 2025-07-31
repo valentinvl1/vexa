@@ -97,3 +97,6 @@
         "VAD_THRESHOLD": "0.5",
         "LOG_LEVEL": "DEBUG"
       }
+    }
+  }
+}
